@@ -610,7 +610,7 @@ class PerspectiveEventFilter(QObject):
 
         # 2. Top Scene Tabs Bar Interactions (When Match is Enabled)
         if t == QEvent.MouseMove and not (event.buttons() & Qt.LeftButton):
-            pos = event.position()
+            pos = event.position() if hasattr(event, "position") else QPointF(event.pos())
             hit_tab = self._hit_test_tabs(pos.x(), pos.y())
             hit_add = (self.plugin.add_view_rect is not None and self.plugin.add_view_rect.contains(pos))
             hit_scale = (self.plugin.scale_tool_rect is not None and self.plugin.scale_tool_rect.contains(pos))
@@ -640,7 +640,7 @@ class PerspectiveEventFilter(QObject):
                     vp.update()
 
         elif t == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-            pos = event.position()
+            pos = event.position() if hasattr(event, "position") else QPointF(event.pos())
 
             # Scene tabs click
             tab_idx = self._hit_test_tabs(pos.x(), pos.y())
@@ -681,7 +681,7 @@ class PerspectiveEventFilter(QObject):
             return False
 
         if t == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-            pos = event.position()
+            pos = event.position() if hasattr(event, "position") else QPointF(event.pos())
             hit = self._hit_test(pos.x(), pos.y(), vp.width(), vp.height())
             if hit is not None:
                 self.active_handle = hit
@@ -692,7 +692,7 @@ class PerspectiveEventFilter(QObject):
                 return True
 
         elif t == QEvent.MouseMove:
-            pos = event.position()
+            pos = event.position() if hasattr(event, "position") else QPointF(event.pos())
             w, h = max(vp.width(), 100), max(vp.height(), 100)
 
             if self.active_handle is not None and (event.buttons() & Qt.LeftButton):
@@ -781,8 +781,9 @@ class PerspectiveMatcherPanel(QWidget):
         # --- Master Enable / Disable Toggle Checkbox ---
         self.chk_match_enabled = QCheckBox(_t("Enable Perspective Match"))
         self.chk_match_enabled.setStyleSheet(
-            "QCheckBox { font-size: 13px; font-weight: bold; padding: 6px; } "
-            "QCheckBox::indicator { width: 18px; height: 18px; }"
+            "QCheckBox { font-size: 13px; font-weight: bold; color: #4CAF50; padding: 4px; }"
+            if self.plugin.data.enabled else
+            "QCheckBox { font-size: 13px; font-weight: bold; color: #B0BEC5; padding: 4px; }"
         )
         self.chk_match_enabled.setChecked(self.plugin.data.enabled)
         self.chk_match_enabled.toggled.connect(self._on_master_toggle_toggled)
@@ -795,6 +796,7 @@ class PerspectiveMatcherPanel(QWidget):
 
         self.views_list = QListWidget()
         self.views_list.currentRowChanged.connect(self._on_view_selected)
+        self.views_list.itemClicked.connect(lambda item: self._on_view_selected(self.views_list.row(item)))
         self.views_list.itemDoubleClicked.connect(lambda _i: self._on_rename_view())
         scenes_lay.addWidget(self.views_list)
 
@@ -989,13 +991,11 @@ class PerspectiveMatcherPanel(QWidget):
         self.chk_match_enabled.setChecked(self.plugin.data.enabled)
         if self.plugin.data.enabled:
             self.chk_match_enabled.setStyleSheet(
-                "QCheckBox { font-size: 13px; font-weight: bold; color: #4CAF50; padding: 6px; } "
-                "QCheckBox::indicator { width: 18px; height: 18px; }"
+                "QCheckBox { font-size: 13px; font-weight: bold; color: #4CAF50; padding: 4px; }"
             )
         else:
             self.chk_match_enabled.setStyleSheet(
-                "QCheckBox { font-size: 13px; font-weight: bold; color: #B0BEC5; padding: 6px; } "
-                "QCheckBox::indicator { width: 18px; height: 18px; }"
+                "QCheckBox { font-size: 13px; font-weight: bold; color: #B0BEC5; padding: 4px; }"
             )
         self.chk_match_enabled.blockSignals(False)
 
@@ -1022,7 +1022,17 @@ class PerspectiveMatcherPanel(QWidget):
             self.spin_current_len.setValue(cur_len)
             self.spin_current_len.blockSignals(False)
 
-        self.lbl_path.setText(os.path.basename(self.plugin.data.image_path) or "")
+        if self.plugin.pixmap is not None and not self.plugin.pixmap.isNull():
+            base_name = os.path.basename(self.plugin.data.image_path) or "Photo Loaded"
+            self.lbl_path.setText(f"🟢 {base_name}")
+            self.lbl_path.setStyleSheet("color: #4CAF50; font-size: 11px;")
+        elif self.plugin.data.image_path:
+            base_name = os.path.basename(self.plugin.data.image_path)
+            self.lbl_path.setText(f"⚠️ {base_name} (file not found)")
+            self.lbl_path.setStyleSheet("color: #FFA726; font-size: 11px;")
+        else:
+            self.lbl_path.setText(_t("No photo loaded"))
+            self.lbl_path.setStyleSheet("color: #888; font-size: 11px;")
 
         for w in (self.slider_opacity, self.chk_show_photo, self.chk_show_guides,
                   self.chk_lock_cam, self.spin_dist, self.chk_inv_x, self.chk_inv_y,
@@ -1062,7 +1072,7 @@ class PerspectiveMatcherPanel(QWidget):
         self.plugin.toggle_enabled(checked)
 
     def _on_view_selected(self, row: int) -> None:
-        if row >= 0 and row != self.plugin.data.active_view_index:
+        if row >= 0:
             self.plugin.switch_to_view(row)
 
     def _on_add_view(self) -> None:
@@ -1226,19 +1236,78 @@ class PerspectiveMatcherPlugin:
             self._restore_photo()
 
     def _restore_photo(self) -> None:
-        """Restores QPixmap from file path or embedded base64."""
+        """Restores QPixmap from file path, candidate user folders, or embedded base64."""
+        # 1. Try exact image_path on disk
         if self.data.image_path and os.path.isfile(self.data.image_path):
-            self.pixmap = QPixmap(self.data.image_path)
-        elif self.data.image_b64:
+            pm = QPixmap(self.data.image_path)
+            if pm is not None and not pm.isNull():
+                self.pixmap = pm
+                self._ensure_b64_backup()
+                return
+
+        # 2. Check candidate folders (Pictures, Downloads, Desktop, Documents)
+        if self.data.image_path:
+            fname = os.path.basename(self.data.image_path)
+            candidate_dirs = [
+                os.path.expanduser("~/Pictures"),
+                os.path.expanduser("~/Downloads"),
+                os.path.expanduser("~/Desktop"),
+                os.path.expanduser("~/Documents"),
+            ]
+            for cdir in candidate_dirs:
+                cpath = os.path.join(cdir, fname)
+                if os.path.isfile(cpath):
+                    pm = QPixmap(cpath)
+                    if pm is not None and not pm.isNull():
+                        self.data.image_path = cpath
+                        self.pixmap = pm
+                        self._ensure_b64_backup()
+                        return
+
+            # Prefix match for UUID or hash filenames (e.g. 2404fc27...)
+            prefix = fname[:16] if len(fname) >= 16 else fname
+            for cdir in candidate_dirs:
+                if os.path.isdir(cdir):
+                    try:
+                        for entry in os.listdir(cdir):
+                            if entry.startswith(prefix) and entry.lower().endswith(
+                                (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff")
+                            ):
+                                fpath = os.path.join(cdir, entry)
+                                pm = QPixmap(fpath)
+                                if pm is not None and not pm.isNull():
+                                    self.data.image_path = fpath
+                                    self.pixmap = pm
+                                    self._ensure_b64_backup()
+                                    return
+                    except Exception:
+                        pass
+
+        # 3. Restore from embedded base64 backup
+        if self.data.image_b64:
             try:
                 ba = QByteArray.fromBase64(self.data.image_b64.encode("ascii"))
                 pm = QPixmap()
                 pm.loadFromData(ba)
-                self.pixmap = pm if not pm.isNull() else None
+                if not pm.isNull():
+                    self.pixmap = pm
+                    return
             except Exception:
-                self.pixmap = None
-        else:
-            self.pixmap = None
+                pass
+
+        self.pixmap = None
+
+    def _ensure_b64_backup(self) -> None:
+        """Ensures image_b64 contains the photo so it survives document transfers."""
+        if self.data.image_path and os.path.isfile(self.data.image_path):
+            try:
+                if not self.data.image_b64:
+                    with open(self.data.image_path, "rb") as f:
+                        raw = f.read()
+                        if len(raw) < 16 * 1024 * 1024:
+                            self.data.image_b64 = base64.b64encode(raw).decode("ascii")
+            except Exception:
+                pass
 
     def on_document_changed(self) -> None:
         """Callback invoked whenever an existing document is opened or updated."""
@@ -1267,6 +1336,8 @@ class PerspectiveMatcherPlugin:
             self.data.active_view_index = 0
             self.update_camera_from_guides()
             self.save_state()
+            if self.panel is not None:
+                self.panel.refresh_ui()
             self.app.viewport.update()
 
     def clear_image(self) -> None:
@@ -1333,7 +1404,8 @@ class PerspectiveMatcherPlugin:
         vtype = view_data.get("type", "custom")
 
         if vtype == "match":
-            # Match view: align camera from vanishing guides & display photo
+            # Match view: always ensure match mode is enabled, solve camera & display photo
+            self.data.enabled = True
             self.update_camera_from_guides()
         else:
             # 3D orbit view: restore exact last saved camera (yaw, pitch, distance, target)
@@ -1557,7 +1629,7 @@ class PerspectiveMatcherPlugin:
         if self.panel is not None:
             self.panel.update_readouts(self.solved)
 
-        if not self.solved.valid or not self.data.enabled:
+        if not self.solved.valid:
             vp.update()
             return
 
@@ -1565,7 +1637,7 @@ class PerspectiveMatcherPlugin:
             self.data.active_view_index < len(self.data.saved_views)
             and self.data.saved_views[self.data.active_view_index].get("type") == "match"
         )
-        if not is_match_tab:
+        if not is_match_tab and not self.data.enabled:
             return
 
         cam = vp.camera
@@ -1605,7 +1677,7 @@ class PerspectiveMatcherPlugin:
             self.scene_tab_rects.append((rect, idx))
 
             is_active = (idx == self.data.active_view_index)
-            is_hover = (idx == self.filter.hovered_tab_index)
+            is_hover = (idx == getattr(self.filter, "hovered_tab_index", None))
 
             painter.setPen(Qt.NoPen)
             if is_active:
@@ -1635,7 +1707,7 @@ class PerspectiveMatcherPlugin:
         add_rect = QRectF(x, y, add_btn_w, tab_h)
         self.add_view_rect = add_rect
 
-        is_add_hover = self.filter.hovered_add_btn
+        is_add_hover = getattr(self.filter, "hovered_add_btn", False)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(QColor(0, 122, 204, 210) if is_add_hover else QColor(30, 34, 44, 190)))
         painter.drawRoundedRect(add_rect, 4.0, 4.0)
@@ -1653,7 +1725,7 @@ class PerspectiveMatcherPlugin:
         scale_rect = QRectF(x, y, scale_btn_w, tab_h)
         self.scale_tool_rect = scale_rect
 
-        is_scale_hover = self.filter.hovered_scale_btn
+        is_scale_hover = getattr(self.filter, "hovered_scale_btn", False)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(QColor(0, 122, 204, 210) if is_scale_hover else QColor(30, 34, 44, 190)))
         painter.drawRoundedRect(scale_rect, 4.0, 4.0)
@@ -1782,13 +1854,23 @@ class PerspectiveMatcherPlugin:
 
     def draw_overlay(self, viewport, painter: QPainter) -> None:
         """Draws SketchUp-style Scene Tabs, Background Photo, Vanishing Guides, and Bottom Help Text."""
+        try:
+            self._safe_draw_overlay(viewport, painter)
+        except Exception:
+            pass
+
+    def _safe_draw_overlay(self, viewport, painter: QPainter) -> None:
         if not self.data.enabled:
             return
 
-        w, h = viewport.width(), viewport.height()
+        w = max(viewport.width(), 100)
+        h = max(viewport.height(), 100)
 
         # 1. ALWAYS Draw Scene Tabs Bar at top when match mode is enabled
-        self._draw_scene_tabs(viewport, painter)
+        try:
+            self._draw_scene_tabs(viewport, painter)
+        except Exception:
+            pass
 
         # 2. Check active view tab
         is_match_tab = (
@@ -1803,15 +1885,18 @@ class PerspectiveMatcherPlugin:
 
         # 3. Draw Background Photograph (in Match view only)
         if self.data.show_image and self.pixmap is not None and not self.pixmap.isNull():
-            painter.save()
-            painter.setOpacity(self.data.image_opacity)
-            scaled = self.pixmap.scaled(
-                w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-            dx = (w - scaled.width()) / 2
-            dy = (h - scaled.height()) / 2
-            painter.drawPixmap(int(dx), int(dy), scaled)
-            painter.restore()
+            try:
+                painter.save()
+                painter.setOpacity(self.data.image_opacity)
+                scaled = self.pixmap.scaled(
+                    w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+                dx = (w - scaled.width()) / 2
+                dy = (h - scaled.height()) / 2
+                painter.drawPixmap(int(dx), int(dy), scaled)
+                painter.restore()
+            except Exception:
+                pass
 
         # 4. Draw Reference Guides
         if not self.data.show_guides:
@@ -1843,12 +1928,15 @@ class PerspectiveMatcherPlugin:
             painter.drawLine(p2_a, p2_b)
 
             if vp_pt is not None:
-                vp_q = QPointF(vp_pt[0], vp_pt[1])
-                dash_pen = QPen(QColor(color.red(), color.green(), color.blue(), 140), 1.0, Qt.DashLine)
-                painter.setPen(dash_pen)
-                painter.drawLine(p1_b, vp_q)
-                painter.drawLine(p2_a, vp_q)
-                painter.drawLine(p2_b, vp_q)
+                vx, vy = vp_pt
+                if not (math.isnan(vx) or math.isnan(vy) or math.isinf(vx) or math.isinf(vy)):
+                    if abs(vx) < 50000 and abs(vy) < 50000:
+                        vp_q = QPointF(vx, vy)
+                        dash_pen = QPen(QColor(color.red(), color.green(), color.blue(), 140), 1.0, Qt.DashLine)
+                        painter.setPen(dash_pen)
+                        painter.drawLine(p1_b, vp_q)
+                        painter.drawLine(p2_a, vp_q)
+                        painter.drawLine(p2_b, vp_q)
 
             draw_handle(p1_a, color, handle_a1)
             draw_handle(p1_b, color, handle_b1)
@@ -1896,9 +1984,11 @@ class PerspectiveMatcherPlugin:
         # Draw Horizon Line between Vx and Vy
         if self.solved.horizon is not None:
             (vx1, vy1), (vx2, vy2) = self.solved.horizon
-            pen_h = QPen(COLOR_HORIZON, 1.5, Qt.DashDotLine)
-            painter.setPen(pen_h)
-            painter.drawLine(QPointF(vx1, vy1), QPointF(vx2, vy2))
+            if not any(math.isnan(c) or math.isinf(c) for c in (vx1, vy1, vx2, vy2)):
+                if all(abs(c) < 50000 for c in (vx1, vy1, vx2, vy2)):
+                    pen_h = QPen(COLOR_HORIZON, 1.5, Qt.DashDotLine)
+                    painter.setPen(pen_h)
+                    painter.drawLine(QPointF(vx1, vy1), QPointF(vx2, vy2))
 
         # Draw Origin Handle
         p_orig = to_px(self.data.origin)
@@ -1908,34 +1998,40 @@ class PerspectiveMatcherPlugin:
         arm = 42.0
 
         if self.solved.vp_x is not None:
-            dx = self.solved.vp_x[0] - p_orig.x()
-            dy = self.solved.vp_x[1] - p_orig.y()
-            l = math.hypot(dx, dy)
-            if l > 1e-4:
-                sign = -1.0 if (self.data.invert_x ^ self.data.swap_xy) else 1.0
-                painter.setPen(QPen(COLOR_X, 2.8))
-                painter.drawLine(p_orig, QPointF(p_orig.x() + sign * arm * dx / l,
-                                                p_orig.y() + sign * arm * dy / l))
+            vx, vy = self.solved.vp_x
+            if not (math.isnan(vx) or math.isnan(vy) or math.isinf(vx) or math.isinf(vy)):
+                dx = vx - p_orig.x()
+                dy = vy - p_orig.y()
+                l = math.hypot(dx, dy)
+                if l > 1e-4:
+                    sign = -1.0 if (self.data.invert_x ^ self.data.swap_xy) else 1.0
+                    painter.setPen(QPen(COLOR_X, 2.8))
+                    painter.drawLine(p_orig, QPointF(p_orig.x() + sign * arm * dx / l,
+                                                    p_orig.y() + sign * arm * dy / l))
 
         if self.solved.vp_y is not None:
-            dx = self.solved.vp_y[0] - p_orig.x()
-            dy = self.solved.vp_y[1] - p_orig.y()
-            l = math.hypot(dx, dy)
-            if l > 1e-4:
-                sign = -1.0 if (self.data.invert_y ^ self.data.swap_xy) else 1.0
-                painter.setPen(QPen(COLOR_Y, 2.8))
-                painter.drawLine(p_orig, QPointF(p_orig.x() + sign * arm * dx / l,
-                                                p_orig.y() + sign * arm * dy / l))
+            vx, vy = self.solved.vp_y
+            if not (math.isnan(vx) or math.isnan(vy) or math.isinf(vx) or math.isinf(vy)):
+                dx = vx - p_orig.x()
+                dy = vy - p_orig.y()
+                l = math.hypot(dx, dy)
+                if l > 1e-4:
+                    sign = -1.0 if (self.data.invert_y ^ self.data.swap_xy) else 1.0
+                    painter.setPen(QPen(COLOR_Y, 2.8))
+                    painter.drawLine(p_orig, QPointF(p_orig.x() + sign * arm * dx / l,
+                                                    p_orig.y() + sign * arm * dy / l))
 
         if self.solved.vp_z is not None and self.data.mode == "3point":
-            dx = self.solved.vp_z[0] - p_orig.x()
-            dy = self.solved.vp_z[1] - p_orig.y()
-            l = math.hypot(dx, dy)
-            if l > 1e-4:
-                sign = -1.0 if self.data.invert_z else 1.0
-                painter.setPen(QPen(COLOR_Z, 2.8))
-                painter.drawLine(p_orig, QPointF(p_orig.x() + sign * arm * dx / l,
-                                                p_orig.y() + sign * arm * dy / l))
+            vx, vy = self.solved.vp_z
+            if not (math.isnan(vx) or math.isnan(vy) or math.isinf(vx) or math.isinf(vy)):
+                dx = vx - p_orig.x()
+                dy = vy - p_orig.y()
+                l = math.hypot(dx, dy)
+                if l > 1e-4:
+                    sign = -1.0 if self.data.invert_z else 1.0
+                    painter.setPen(QPen(COLOR_Z, 2.8))
+                    painter.drawLine(p_orig, QPointF(p_orig.x() + sign * arm * dx / l,
+                                                    p_orig.y() + sign * arm * dy / l))
         else:
             painter.setPen(QPen(COLOR_Z, 2.8))
             sign = 1.0 if self.data.invert_z else -1.0
@@ -1951,12 +2047,12 @@ class PerspectiveMatcherPlugin:
         font.setBold(True)
         painter.setFont(font)
 
-        if self.filter.is_shift_held:
+        if getattr(self.filter, "is_shift_held", False):
             painter.setPen(QPen(QColor(76, 175, 80)))
             guide_msg = "⚡ PRECISION MODE ACTIVE (0.2×): Drag handles slowly to calibrate • Release Shift for normal speed"
         else:
             painter.setPen(QPen(QColor(230, 230, 230)))
-            guide_msg = "💡 Drag red/green/blue handles to match photo • Hold Shift for precision zoom • Click [Perspective] to orbit 3D"
+            guide_msg = "💡 Drag red/green/blue handles to match photo • Hold Shift for precision zoom • Click [Default 3D] to orbit 3D"
 
         painter.drawText(guide_rect.adjusted(10, 0, -10, 0), Qt.AlignVCenter | Qt.AlignLeft, guide_msg)
 
@@ -1968,12 +2064,15 @@ class PerspectiveMatcherPlugin:
         painter.restore()
 
         # 5. Draw clean optical loupe during dragging (No dark text clutter)
-        if self.filter.active_handle is not None:
+        if getattr(self.filter, "active_handle", None) is not None:
             rel = getattr(self.data, self.filter.active_handle, None)
             if rel is not None:
                 hx = rel[0] * w
                 hy = rel[1] * h
-                self._draw_loupe(viewport, painter, hx, hy, self.filter.active_handle)
+                try:
+                    self._draw_loupe(viewport, painter, hx, hy, self.filter.active_handle)
+                except Exception:
+                    pass
 
 
 # ---- Extension Setup Entry Point -------------------------------------------
