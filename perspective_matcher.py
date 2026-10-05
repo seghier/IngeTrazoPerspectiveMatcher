@@ -135,11 +135,15 @@ def get_selected_edge_info(scene) -> Optional[Tuple[float, str]]:
     return None
 
 
-def scale_scene_geometry(scene, factor: float) -> None:
-    """Scales all geometry in scene (loose mesh and groups) around origin (0, 0, 0).
-    Properly updates mesh registry and chunk dirty flags via place_vertex."""
+def scale_scene_geometry(scene, factor: float, anchor: Optional[QVector3D] = None, viewport=None) -> None:
+    """Scales all geometry in scene (loose meshes, all groups, components, billboard figures,
+    guides, dimensions, and image planes) uniformly about anchor (0, 0, 0).
+    Properly updates mesh registries, chunk dirty flags, and purges viewport caches."""
     if scene is None or abs(factor - 1.0) < 1e-7:
         return
+
+    if anchor is None:
+        anchor = QVector3D(0.0, 0.0, 0.0)
 
     # 1. Scale loose mesh vertices using place_vertex for registry integrity
     if hasattr(scene, "mesh") and scene.mesh is not None:
@@ -148,11 +152,7 @@ def scale_scene_geometry(scene, factor: float) -> None:
             for v in list(mesh.vertices):
                 if hasattr(v, "position") and hasattr(v.position, "x"):
                     pos = v.position
-                    new_pos = QVector3D(
-                        float(pos.x()) * factor,
-                        float(pos.y()) * factor,
-                        float(pos.z()) * factor
-                    )
+                    new_pos = anchor + (pos - anchor) * factor
                     if hasattr(mesh, "place_vertex"):
                         mesh.place_vertex(v, new_pos)
                     else:
@@ -160,80 +160,140 @@ def scale_scene_geometry(scene, factor: float) -> None:
             if hasattr(mesh, "_chunk_dirty"):
                 mesh._chunk_dirty = True
 
-    # 2. Scale groups (groups/components)
+    # 2. Scale groups (classic groups, component instances, billboard figures)
     if hasattr(scene, "groups") and scene.groups:
         for g in scene.groups:
-            _scale_group_recursive(g, factor)
+            _scale_group_recursive(g, factor, anchor)
 
     # 3. Scale guide points and segments if present
     if hasattr(scene, "guides") and scene.guides:
         for guide in scene.guides:
             if hasattr(guide, "point") and hasattr(guide.point, "x"):
                 p = guide.point
-                guide.point = QVector3D(
-                    float(p.x()) * factor,
-                    float(p.y()) * factor,
-                    float(p.z()) * factor
-                )
+                guide.point = anchor + (p - anchor) * factor
             if hasattr(guide, "origin") and guide.origin is not None and hasattr(guide.origin, "x"):
                 orig = guide.origin
-                guide.origin = QVector3D(
-                    float(orig.x()) * factor,
-                    float(orig.y()) * factor,
-                    float(orig.z()) * factor
-                )
+                guide.origin = anchor + (orig - anchor) * factor
 
     # 4. Scale dimensions if present
     if hasattr(scene, "dimensions") and scene.dimensions:
         for dim in scene.dimensions:
             if hasattr(dim, "_a") and hasattr(dim._a, "x"):
-                dim._a = QVector3D(float(dim._a.x()) * factor, float(dim._a.y()) * factor, float(dim._a.z()) * factor)
+                dim._a = anchor + (dim._a - anchor) * factor
             if hasattr(dim, "_b") and hasattr(dim._b, "x"):
-                dim._b = QVector3D(float(dim._b.x()) * factor, float(dim._b.y()) * factor, float(dim._b.z()) * factor)
+                dim._b = anchor + (dim._b - anchor) * factor
             if hasattr(dim, "offset") and hasattr(dim.offset, "x"):
-                dim.offset = QVector3D(float(dim.offset.x()) * factor, float(dim.offset.y()) * factor, float(dim.offset.z()) * factor)
+                dim.offset = dim.offset * factor
 
     # 5. Scale image planes if present
     if hasattr(scene, "image_planes") and scene.image_planes:
         for im in scene.image_planes:
             if hasattr(im, "origin") and hasattr(im.origin, "x"):
-                im.origin = QVector3D(float(im.origin.x()) * factor, float(im.origin.y()) * factor, float(im.origin.z()) * factor)
+                im.origin = anchor + (im.origin - anchor) * factor
             if hasattr(im, "u") and hasattr(im.u, "x"):
-                im.u = QVector3D(float(im.u.x()) * factor, float(im.u.y()) * factor, float(im.u.z()) * factor)
+                im.u = im.u * factor
             if hasattr(im, "v") and hasattr(im.v, "x"):
-                im.v = QVector3D(float(im.v.x()) * factor, float(im.v.y()) * factor, float(im.v.z()) * factor)
+                im.v = im.v * factor
 
+    # 6. Bump scene versions so caches recognize mutation
     if hasattr(scene, "version"):
         scene.version += 1
+    if hasattr(scene, "view_version"):
+        scene.view_version += 1
+
+    # 7. Invalidate viewport caches (vital for billboards and group chunks)
+    if viewport is not None:
+        try:
+            if hasattr(viewport, "reset_document_caches"):
+                viewport.reset_document_caches()
+            else:
+                for attr in ("_billboard_world", "_fp_memo", "_group_chunks", "_inst_chunks"):
+                    c = getattr(viewport, attr, None)
+                    if isinstance(c, dict):
+                        c.clear()
+                viewport._billboard_groups = None
+                viewport._edges_version = -1
+        except Exception:
+            pass
 
 
-def _scale_group_recursive(group, factor: float) -> None:
-    """Recursively scales a Group around origin (0, 0, 0)."""
+def _scale_group_recursive(group, factor: float, anchor: QVector3D) -> None:
+    """Recursively scales a Group around anchor.
+    Handles component xform, classic group mesh, UVWs, local axes, and billboard textures."""
+    # Component instance: compose xform with scale matrix around anchor
     if hasattr(group, "xform") and group.xform is not None:
         mat = QMatrix4x4()
+        mat.translate(anchor)
         mat.scale(factor, factor, factor)
+        mat.translate(-anchor)
         group.xform = mat * group.xform
     elif hasattr(group, "mesh") and group.mesh is not None:
-        mesh = group.mesh
-        if hasattr(mesh, "vertices"):
-            for v in list(mesh.vertices):
+        gmesh = group.mesh
+        if hasattr(gmesh, "vertices"):
+            for v in list(gmesh.vertices):
                 if hasattr(v, "position") and hasattr(v.position, "x"):
                     pos = v.position
-                    new_pos = QVector3D(
-                        float(pos.x()) * factor,
-                        float(pos.y()) * factor,
-                        float(pos.z()) * factor
-                    )
-                    if hasattr(mesh, "place_vertex"):
-                        mesh.place_vertex(v, new_pos)
+                    new_pos = anchor + (pos - anchor) * factor
+                    if hasattr(gmesh, "place_vertex"):
+                        gmesh.place_vertex(v, new_pos)
                     else:
                         v.position = new_pos
-            if hasattr(mesh, "_chunk_dirty"):
-                mesh._chunk_dirty = True
+            if hasattr(gmesh, "_chunk_dirty"):
+                gmesh._chunk_dirty = True
+
+        # Remap UVWs & carry axes for classic groups
+        try:
+            from core.group import _remap_uvws, carry_axes
+            m = QMatrix4x4()
+            m.translate(anchor)
+            m.scale(factor, factor, factor)
+            m.translate(-anchor)
+            _remap_uvws(gmesh, m)
+            carry_axes(group, m)
+        except Exception:
+            pass
+
+    # Billboard scale figure: scale texture bounding dimensions
+    if getattr(group, "billboard", False) and hasattr(group, "mesh") and group.mesh is not None:
+        for f in group.mesh.faces:
+            if f.attrs and "texture" in f.attrs:
+                t = f.attrs["texture"]
+                if "sw" in t and t["sw"] is not None:
+                    t["sw"] = float(t["sw"]) * factor
+                if "sh" in t and t["sh"] is not None:
+                    t["sh"] = float(t["sh"]) * factor
 
     if hasattr(group, "children") and group.children:
         for child in group.children:
-            _scale_group_recursive(child, factor)
+            _scale_group_recursive(child, factor, anchor)
+
+
+try:
+    from core.history import Command
+except Exception:
+    class Command:  # type: ignore
+        def do(self, scene) -> None: pass
+        def undo(self, scene) -> None: pass
+
+
+class ScaleMatchSceneCommand(Command):
+    """Reversible command that scales the entire scene and perspective match distance."""
+
+    def __init__(self, factor: float, plugin: Any, anchor: Optional[QVector3D] = None) -> None:
+        self.factor = float(factor)
+        self.anchor = QVector3D(anchor) if anchor is not None else QVector3D(0.0, 0.0, 0.0)
+        self.plugin = plugin
+        self._executed = False
+
+    def do(self, scene) -> None:
+        if self._executed:
+            self.plugin._apply_scale_factor(self.factor, self.anchor, register_history=False)
+        else:
+            self._executed = True
+
+    def undo(self, scene) -> None:
+        inv_factor = 1.0 / self.factor if abs(self.factor) > 1e-6 else 1.0
+        self.plugin._apply_scale_factor(inv_factor, self.anchor, register_history=False)
 
 
 # ---- Mathematical Projective Geometry Solver -------------------------------
@@ -814,18 +874,50 @@ class PerspectiveMatcherPanel(QWidget):
 
         lay.addWidget(scenes_grp)
 
-        # --- Real-World Scale Calibration Section ---
-        scale_grp = QGroupBox(_t("Real-World Scale Calibration"))
+        # --- Real-World Scale & Distance Section ---
+        scale_grp = QGroupBox(_t("Real-World Scale & Distance"))
         scale_lay = QVBoxLayout(scale_grp)
         scale_lay.setSpacing(6)
 
-        self.lbl_selected_edge = QLabel(_t("Select an edge in the viewport to match scale."))
+        dist_row = QHBoxLayout()
+        dist_row.addWidget(QLabel(_t("Camera Distance:")))
+        self.spin_dist = QDoubleSpinBox()
+        self.spin_dist.setRange(0.5, 50000.0)
+        self.spin_dist.setDecimals(2)
+        self.spin_dist.setSingleStep(1.0)
+        self.spin_dist.setValue(self.plugin.data.distance)
+        self.spin_dist.setSuffix(" m")
+        self.spin_dist.valueChanged.connect(self._on_dist_spin_changed)
+        dist_row.addWidget(self.spin_dist)
+        scale_lay.addLayout(dist_row)
+
+        slider_row = QHBoxLayout()
+        slider_row.addWidget(QLabel(_t("Match Scale:")))
+        self.slider_scale = QSlider(Qt.Horizontal)
+        self.slider_scale.setRange(10, 2000)  # 1.0m to 200.0m with 0.1m step
+        self.slider_scale.setValue(min(2000, max(10, int(self.plugin.data.distance * 10))))
+        self.slider_scale.sliderPressed.connect(self._on_scale_slider_pressed)
+        self.slider_scale.valueChanged.connect(self._on_scale_slider_changed)
+        self.slider_scale.sliderReleased.connect(self._on_scale_slider_released)
+        slider_row.addWidget(self.slider_scale)
+        scale_lay.addLayout(slider_row)
+
+        self.chk_scale_scene_with_view = QCheckBox(_t("Scale Model with View (Fixed on Photo)"))
+        self.chk_scale_scene_with_view.setChecked(True)
+        self.chk_scale_scene_with_view.setStyleSheet("font-weight: bold; color: #64B5F6;")
+        self.chk_scale_scene_with_view.setToolTip(
+            _t("When enabled, adjusting distance/scale scales 3D scene geometry proportionally so the volume remains 100% fixed on top of the background photograph.")
+        )
+        scale_lay.addWidget(self.chk_scale_scene_with_view)
+
+        # Selected Edge Calibration Sub-section
+        self.lbl_selected_edge = QLabel(_t("Select an edge in viewport to calibrate real scale:"))
         self.lbl_selected_edge.setStyleSheet("color: #AAA; font-size: 11px;")
         self.lbl_selected_edge.setWordWrap(True)
         scale_lay.addWidget(self.lbl_selected_edge)
 
         cur_row = QHBoxLayout()
-        cur_row.addWidget(QLabel(_t("Current Length (m):")))
+        cur_row.addWidget(QLabel(_t("Current Length:")))
         self.spin_current_len = QDoubleSpinBox()
         self.spin_current_len.setRange(0.001, 100000.0)
         self.spin_current_len.setDecimals(3)
@@ -835,7 +927,7 @@ class PerspectiveMatcherPanel(QWidget):
         scale_lay.addLayout(cur_row)
 
         target_row = QHBoxLayout()
-        target_row.addWidget(QLabel(_t("Real Length (m):")))
+        target_row.addWidget(QLabel(_t("Real Length:")))
         self.spin_target_len = QDoubleSpinBox()
         self.spin_target_len.setRange(0.001, 100000.0)
         self.spin_target_len.setDecimals(3)
@@ -908,16 +1000,6 @@ class PerspectiveMatcherPanel(QWidget):
         self.combo_mode.currentIndexChanged.connect(self._on_mode_changed)
         mode_row.addWidget(self.combo_mode)
         solve_lay.addLayout(mode_row)
-
-        dist_row = QHBoxLayout()
-        dist_row.addWidget(QLabel(_t("Camera Distance (m):")))
-        self.spin_dist = QDoubleSpinBox()
-        self.spin_dist.setRange(0.5, 50000.0)
-        self.spin_dist.setSingleStep(1.0)
-        self.spin_dist.setValue(self.plugin.data.distance)
-        self.spin_dist.valueChanged.connect(self._on_dist_changed)
-        dist_row.addWidget(self.spin_dist)
-        solve_lay.addLayout(dist_row)
 
         inv_row1 = QHBoxLayout()
         self.chk_inv_x = QCheckBox(_t("Invert X Axis"))
@@ -1035,7 +1117,7 @@ class PerspectiveMatcherPanel(QWidget):
             self.lbl_path.setStyleSheet("color: #888; font-size: 11px;")
 
         for w in (self.slider_opacity, self.chk_show_photo, self.chk_show_guides,
-                  self.chk_lock_cam, self.spin_dist, self.chk_inv_x, self.chk_inv_y,
+                  self.chk_lock_cam, self.spin_dist, self.slider_scale, self.chk_inv_x, self.chk_inv_y,
                   self.chk_inv_z, self.chk_swap_xy, self.combo_mode):
             w.blockSignals(True)
 
@@ -1045,6 +1127,7 @@ class PerspectiveMatcherPanel(QWidget):
         self.chk_show_guides.setChecked(self.plugin.data.show_guides)
         self.chk_lock_cam.setChecked(self.plugin.data.camera_locked)
         self.spin_dist.setValue(self.plugin.data.distance)
+        self.slider_scale.setValue(min(2000, max(10, int(self.plugin.data.distance * 10))))
         self.chk_inv_x.setChecked(self.plugin.data.invert_x)
         self.chk_inv_y.setChecked(self.plugin.data.invert_y)
         self.chk_inv_z.setChecked(self.plugin.data.invert_z)
@@ -1054,7 +1137,7 @@ class PerspectiveMatcherPanel(QWidget):
             self.combo_mode.setCurrentIndex(idx)
 
         for w in (self.slider_opacity, self.chk_show_photo, self.chk_show_guides,
-                  self.chk_lock_cam, self.spin_dist, self.chk_inv_x, self.chk_inv_y,
+                  self.chk_lock_cam, self.spin_dist, self.slider_scale, self.chk_inv_x, self.chk_inv_y,
                   self.chk_inv_z, self.chk_swap_xy, self.combo_mode):
             w.blockSignals(False)
 
@@ -1154,10 +1237,70 @@ class PerspectiveMatcherPanel(QWidget):
         self.plugin.update_camera_from_guides()
         self.plugin.save_state()
 
-    def _on_dist_changed(self, val: float) -> None:
-        self.plugin.data.distance = val
-        self.plugin.update_camera_from_guides()
+    def _on_scale_slider_pressed(self) -> None:
+        self._drag_start_dist = max(0.5, self.plugin.data.distance)
+        self._drag_last_dist = self._drag_start_dist
+
+    def _on_scale_slider_changed(self, val: int) -> None:
+        new_dist = max(0.5, val / 10.0)
+        self.spin_dist.blockSignals(True)
+        self.spin_dist.setValue(new_dist)
+        self.spin_dist.blockSignals(False)
+
+        if getattr(self, "_is_internal_scale_sync", False):
+            return
+
+        if self.chk_scale_scene_with_view.isChecked():
+            last_dist = getattr(self, "_drag_last_dist", self.plugin.data.distance)
+            if last_dist > 1e-4 and abs(new_dist - last_dist) > 1e-4:
+                factor = new_dist / last_dist
+                self._drag_last_dist = new_dist
+                self.plugin._apply_scale_factor(factor, register_history=False)
+        else:
+            self.plugin.data.distance = new_dist
+            self.plugin.update_camera_from_guides()
+            self.plugin.save_state()
+
+    def _on_scale_slider_released(self) -> None:
+        if self.chk_scale_scene_with_view.isChecked():
+            start_dist = getattr(self, "_drag_start_dist", None)
+            curr_dist = self.plugin.data.distance
+            if start_dist is not None and start_dist > 1e-4:
+                total_factor = curr_dist / start_dist
+                if abs(total_factor - 1.0) > 1e-4:
+                    vp = self.plugin.app.viewport
+                    if hasattr(vp, "history"):
+                        try:
+                            cmd = ScaleMatchSceneCommand(total_factor, self.plugin)
+                            cmd._executed = True
+                            vp.history.undo_stack.append(cmd)
+                            vp.history.redo_stack.clear()
+                        except Exception:
+                            pass
         self.plugin.save_state()
+        self._drag_start_dist = None
+        self._drag_last_dist = None
+
+    def _on_dist_spin_changed(self, val: float) -> None:
+        if getattr(self, "_is_internal_scale_sync", False):
+            return
+        new_dist = max(0.5, val)
+        self._is_internal_scale_sync = True
+        try:
+            self.slider_scale.blockSignals(True)
+            self.slider_scale.setValue(min(2000, max(10, int(new_dist * 10))))
+            self.slider_scale.blockSignals(False)
+
+            old_dist = self.plugin.data.distance
+            if self.chk_scale_scene_with_view.isChecked() and old_dist > 1e-4 and abs(new_dist - old_dist) > 1e-4:
+                factor = new_dist / old_dist
+                self.plugin._apply_scale_factor(factor, register_history=True)
+            else:
+                self.plugin.data.distance = new_dist
+                self.plugin.update_camera_from_guides()
+                self.plugin.save_state()
+        finally:
+            self._is_internal_scale_sync = False
 
     def _on_toggle_inv_x(self, checked: bool) -> None:
         self.plugin.data.invert_x = checked
@@ -1477,38 +1620,25 @@ class PerspectiveMatcherPlugin:
             return None
         return get_selected_edge_info(scene)
 
-    def scale_model_to_edge(self, current_len: float, target_len: float) -> Tuple[bool, str]:
-        """Scales the 3D scene geometry and camera distance to match the real dimension.
-        Preserves camera optical rays so the photo perspective match is 100% untouched!"""
-        if current_len <= 1e-6 or target_len <= 1e-6:
-            return False, "Invalid distance values"
+    def _apply_scale_factor(self, factor: float, anchor: Optional[QVector3D] = None, register_history: bool = True) -> bool:
+        """Scales the entire 3D scene geometry, camera distance, and saved views uniformly.
+        Because camera optical rays scale proportionally around the match origin, the 3D volume
+        seen through the perspective match camera remains 100% FIXED on top of the background photo."""
+        if abs(factor - 1.0) < 1e-6 or factor <= 1e-6:
+            return False
 
-        factor = target_len / current_len
-        if abs(factor - 1.0) < 1e-6:
-            return True, "Scale is already 1.0×"
+        if anchor is None:
+            anchor = QVector3D(0.0, 0.0, 0.0)
 
         vp = self.app.viewport
         scene = getattr(vp, "scene", None)
         if scene is None:
-            return False, "No active scene"
+            return False
 
         self._is_internal_update = True
         try:
-            # 1. Scale scene geometry
-            def mutate(sc):
-                scale_scene_geometry(sc, factor)
-
-            executed = False
-            try:
-                from core.history import SnapshotImport
-                cmd = SnapshotImport(mutate)
-                vp.history.execute(cmd)
-                executed = True
-            except Exception:
-                pass
-
-            if not executed:
-                mutate(scene)
+            # 1. Scale entire scene geometry uniformly (meshes, groups, billboards, guides, dimensions)
+            scale_scene_geometry(scene, factor, anchor=anchor, viewport=vp)
 
             # 2. Scale camera distance in PerspectiveMatchData
             self.data.distance *= factor
@@ -1520,11 +1650,9 @@ class PerspectiveMatcherPlugin:
                     if "distance" in cam_state:
                         cam_state["distance"] = float(cam_state["distance"]) * factor
                     if "target" in cam_state and isinstance(cam_state["target"], list) and len(cam_state["target"]) == 3:
-                        cam_state["target"] = [
-                            float(cam_state["target"][0]) * factor,
-                            float(cam_state["target"][1]) * factor,
-                            float(cam_state["target"][2]) * factor,
-                        ]
+                        t = QVector3D(float(cam_state["target"][0]), float(cam_state["target"][1]), float(cam_state["target"][2]))
+                        new_t = anchor + (t - anchor) * factor
+                        cam_state["target"] = [new_t.x(), new_t.y(), new_t.z()]
 
             # 4. Re-solve perspective with updated distance
             w, h = max(vp.width(), 100), max(vp.height(), 100)
@@ -1546,7 +1674,8 @@ class PerspectiveMatcherPlugin:
             else:
                 cam = vp.camera
                 cam.distance *= factor
-                cam.target = QVector3D(cam.target.x() * factor, cam.target.y() * factor, cam.target.z() * factor)
+                new_t = anchor + (cam.target - anchor) * factor
+                cam.target = new_t
 
             # 6. Save state to document
             payload = self.data.to_dict()
@@ -1560,33 +1689,70 @@ class PerspectiveMatcherPlugin:
             except Exception:
                 pass
 
+            # 7. Register undo history if requested
+            if register_history and hasattr(vp, "history"):
+                try:
+                    cmd = ScaleMatchSceneCommand(factor, self, anchor)
+                    cmd._executed = True
+                    vp.history.undo_stack.append(cmd)
+                    vp.history.redo_stack.clear()
+                except Exception:
+                    pass
+
+            # 8. Force full viewport redraw
             vp.update()
+            return True
         finally:
             self._is_internal_update = False
 
-        msg = f"Scaled by {factor:.3f}×. Edge is now {target_len:.3f} m (Match preserved)"
-        return True, msg
+    def scale_model_to_edge(self, current_len: float, target_len: float) -> Tuple[bool, str]:
+        """Scales the entire 3D scene geometry and camera distance to match the real dimension.
+        Preserves camera optical rays so the photo perspective match is 100% untouched!"""
+        if current_len <= 1e-6 or target_len <= 1e-6:
+            return False, "Invalid distance values"
+
+        factor = target_len / current_len
+        if abs(factor - 1.0) < 1e-6:
+            return True, "Scale is already 1.0×"
+
+        ok = self._apply_scale_factor(factor, anchor=QVector3D(0.0, 0.0, 0.0), register_history=True)
+        if ok:
+            if self.panel is not None:
+                self.panel.refresh_ui()
+            msg = f"Scaled entire scene by {factor:.3f}×. Edge is now {target_len:.3f} m (Photo match preserved)"
+            return True, msg
+        return False, "Failed to apply scene scale"
 
     def open_scale_dialog(self) -> None:
-        """Opens quick modal dialog to calibrate scene scale directly from viewport."""
+        """Opens interactive modal dialog to calibrate scene scale and adjust match distance."""
         info = self.get_selected_edge_info()
         init_cur = info[0] if info else 1.0
 
         parent_win = self.panel.window() if self.panel is not None else None
         dlg = QDialog(parent_win)
-        dlg.setWindowTitle(_t("Real-World Scale Calibration"))
-        dlg.setFixedWidth(360)
+        dlg.setWindowTitle(_t("Real-World Scale & Distance Calibration"))
+        dlg.setFixedWidth(400)
         lay = QVBoxLayout(dlg)
-        lay.setSpacing(10)
+        lay.setSpacing(12)
+
+        hdr_lbl = QLabel(
+            _t("Scale the entire scene and perspective camera together.\n"
+               "The volume will remain 100% locked to the photo view.")
+        )
+        hdr_lbl.setStyleSheet("color: #90CAF9; font-size: 11px;")
+        hdr_lbl.setWordWrap(True)
+        lay.addWidget(hdr_lbl)
 
         info_lbl = QLabel(
-            f"🟢 {_t('Detected:')} {info[1]}" if info else _t("⚪ Select an edge in viewport or enter below:")
+            f"🟢 {_t('Detected:')} {info[1]}" if info else _t("⚪ Select an edge in viewport or enter lengths below:")
         )
         info_lbl.setStyleSheet("font-size: 11px; color: #4CAF50;" if info else "font-size: 11px; color: #FFA726;")
         info_lbl.setWordWrap(True)
         lay.addWidget(info_lbl)
 
         form = QFormLayout()
+        form.setSpacing(8)
+
         cur_spin = QDoubleSpinBox()
         cur_spin.setRange(0.001, 100000.0)
         cur_spin.setDecimals(3)
@@ -1602,9 +1768,46 @@ class PerspectiveMatcherPlugin:
         form.addRow(_t("Real Length:"), tgt_spin)
         lay.addLayout(form)
 
+        # Interactive Scale Multiplier Section
+        slider_box = QGroupBox(_t("Interactive Scale Multiplier"))
+        slider_lay = QVBoxLayout(slider_box)
+        slider_lay.setSpacing(6)
+
+        initial_mult = tgt_spin.value() / max(cur_spin.value(), 1e-4)
+        mult_lbl = QLabel(f"Scale Factor: {initial_mult:.3f}× (Camera Dist: {self.data.distance * initial_mult:.1f} m)")
+        mult_lbl.setStyleSheet("font-weight: bold; color: #E0E0E0;")
+        slider_lay.addWidget(mult_lbl)
+
+        mult_slider = QSlider(Qt.Horizontal)
+        mult_slider.setRange(10, 500)
+        mult_slider.setValue(min(500, max(10, int(initial_mult * 100))))
+        slider_lay.addWidget(mult_slider)
+        lay.addWidget(slider_box)
+
+        def on_spin_changed():
+            c = cur_spin.value()
+            t = tgt_spin.value()
+            if c > 1e-6:
+                ratio = t / c
+                mult_lbl.setText(f"Scale Factor: {ratio:.3f}× (Camera Dist: {self.data.distance * ratio:.1f} m)")
+                mult_slider.blockSignals(True)
+                mult_slider.setValue(min(500, max(10, int(ratio * 100))))
+                mult_slider.blockSignals(False)
+
+        def on_slider_changed(val):
+            ratio = val / 100.0
+            tgt_spin.blockSignals(True)
+            tgt_spin.setValue(cur_spin.value() * ratio)
+            tgt_spin.blockSignals(False)
+            mult_lbl.setText(f"Scale Factor: {ratio:.3f}× (Camera Dist: {self.data.distance * ratio:.1f} m)")
+
+        cur_spin.valueChanged.connect(on_spin_changed)
+        tgt_spin.valueChanged.connect(on_spin_changed)
+        mult_slider.valueChanged.connect(on_slider_changed)
+
         btn_row = QHBoxLayout()
         apply_btn = QPushButton(_t("Apply Scale"))
-        apply_btn.setStyleSheet("background-color: #007ACC; color: white; font-weight: bold; padding: 6px;")
+        apply_btn.setStyleSheet("background-color: #007ACC; color: white; font-weight: bold; padding: 7px; border-radius: 3px;")
         cancel_btn = QPushButton(_t("Cancel"))
         btn_row.addWidget(apply_btn)
         btn_row.addWidget(cancel_btn)
@@ -1720,8 +1923,9 @@ class PerspectiveMatcherPlugin:
 
         x += add_btn_w + 6.0
 
-        # Calibrate Real Scale Button [📏]
-        scale_btn_w = 32.0
+        # Calibrate Real Scale Button [📏 Scale]
+        scale_label = f"📏 {_t('Scale')}"
+        scale_btn_w = fm.horizontalAdvance(scale_label) + 18.0
         scale_rect = QRectF(x, y, scale_btn_w, tab_h)
         self.scale_tool_rect = scale_rect
 
@@ -1734,7 +1938,7 @@ class PerspectiveMatcherPlugin:
         painter.drawRoundedRect(scale_rect, 4.0, 4.0)
 
         painter.setPen(QPen(Qt.white))
-        painter.drawText(scale_rect, Qt.AlignCenter, "📏")
+        painter.drawText(scale_rect, Qt.AlignCenter, scale_label)
 
         painter.restore()
 
