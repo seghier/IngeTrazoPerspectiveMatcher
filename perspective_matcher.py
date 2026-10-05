@@ -294,17 +294,13 @@ class ScaleMatchSceneCommand(Command):
         self.factor = float(factor)
         self.anchor = QVector3D(anchor) if anchor is not None else QVector3D(0.0, 0.0, 0.0)
         self.plugin = plugin
-        self._executed = False
 
     def do(self, scene) -> None:
-        if self._executed:
-            self.plugin._apply_scale_factor(self.factor, self.anchor, register_history=False)
-        else:
-            self._executed = True
+        self.plugin._do_apply_scale_factor(self.factor, self.anchor)
 
     def undo(self, scene) -> None:
         inv_factor = 1.0 / self.factor if abs(self.factor) > 1e-6 else 1.0
-        self.plugin._apply_scale_factor(inv_factor, self.anchor, register_history=False)
+        self.plugin._do_apply_scale_factor(inv_factor, self.anchor)
 
 
 # ---- Mathematical Projective Geometry Solver -------------------------------
@@ -343,6 +339,8 @@ class PerspectiveMatchData:
         self.camera_locked: bool = False
         self.mode: str = "3point"  # "2point" or "3point"
         self.distance: float = 30.0  # meters from origin
+        self.cumulative_scale: float = 1.0  # Tracks cumulative scale relative to original model (1.0 = baseline)
+        self.scale_model_with_view: bool = False  # OFF by default to protect model dimensions and takeoffs
         self.invert_x: bool = False
         self.invert_y: bool = False
         self.invert_z: bool = False
@@ -405,6 +403,8 @@ class PerspectiveMatchData:
             "camera_locked": self.camera_locked,
             "mode": self.mode,
             "distance": self.distance,
+            "cumulative_scale": self.cumulative_scale,
+            "scale_model_with_view": self.scale_model_with_view,
             "invert_x": self.invert_x,
             "invert_y": self.invert_y,
             "invert_z": self.invert_z,
@@ -440,6 +440,8 @@ class PerspectiveMatchData:
         self.camera_locked = bool(d.get("camera_locked", self.camera_locked))
         self.mode = str(d.get("mode", self.mode))
         self.distance = float(d.get("distance", self.distance))
+        self.cumulative_scale = float(d.get("cumulative_scale", 1.0))
+        self.scale_model_with_view = bool(d.get("scale_model_with_view", False))
         self.invert_x = bool(d.get("invert_x", self.invert_x))
         self.invert_y = bool(d.get("invert_y", self.invert_y))
         self.invert_z = bool(d.get("invert_z", self.invert_z))
@@ -1098,12 +1100,26 @@ class PerspectiveMatcherPanel(QWidget):
         scale_lay.addLayout(slider_row)
 
         self.chk_scale_scene_with_view = QCheckBox(_t("Scale Model with View (Fixed on Photo)"))
-        self.chk_scale_scene_with_view.setChecked(True)
+        self.chk_scale_scene_with_view.setChecked(self.plugin.data.scale_model_with_view)
         self.chk_scale_scene_with_view.setStyleSheet("font-weight: bold; color: #64B5F6;")
         self.chk_scale_scene_with_view.setToolTip(
             _t("When enabled, adjusting distance/scale scales 3D scene geometry proportionally so the volume remains 100% fixed on top of the background photograph.")
         )
+        self.chk_scale_scene_with_view.toggled.connect(self._on_toggle_scale_scene_with_view)
         scale_lay.addWidget(self.chk_scale_scene_with_view)
+
+        # Cumulative Model Scale Status & Reset Row
+        scale_status_row = QHBoxLayout()
+        self.lbl_scale_factor = QLabel(_t("Scale: 1.000× (Original)"))
+        self.lbl_scale_factor.setStyleSheet("color: #88C0D0; font-size: 11px;")
+        scale_status_row.addWidget(self.lbl_scale_factor)
+
+        self.btn_reset_scale = QPushButton(_t("🔄 Reset to Original"))
+        self.btn_reset_scale.setToolTip(_t("Resets 3D model geometry and match distance back to original scale (1.000×). Undoable with Ctrl+Z."))
+        self.btn_reset_scale.clicked.connect(self._on_reset_scale_clicked)
+        self.btn_reset_scale.setEnabled(False)
+        scale_status_row.addWidget(self.btn_reset_scale)
+        scale_lay.addLayout(scale_status_row)
 
         # Selected Edge Calibration Sub-section
         self.lbl_selected_edge = QLabel(_t("Select an edge in viewport to calibrate real scale:"))
@@ -1349,6 +1365,45 @@ class PerspectiveMatcherPanel(QWidget):
                 self.btn_lock_cam.setToolTip(_t("Lock camera so it cannot move, rotate, or zoom."))
                 self.btn_lock_cam.setStyleSheet("")
 
+        self.refresh_scale_ui()
+
+    def refresh_scale_ui(self) -> None:
+        """Updates scale readout and enables/disables the Reset to Original button."""
+        cum_scale = getattr(self.plugin.data, "cumulative_scale", 1.0)
+        is_modified = abs(cum_scale - 1.0) >= 1e-4
+
+        if not is_modified:
+            self.lbl_scale_factor.setText(_t("Scale: 1.000× (Original)"))
+            self.lbl_scale_factor.setStyleSheet("color: #88C0D0; font-size: 11px;")
+            self.btn_reset_scale.setEnabled(False)
+            self.btn_reset_scale.setStyleSheet("")
+        else:
+            self.lbl_scale_factor.setText(f"{_t('Scale:')} {cum_scale:.3f}× ({_t('Modified')})")
+            self.lbl_scale_factor.setStyleSheet("color: #EBCB8B; font-weight: bold; font-size: 11px;")
+            self.btn_reset_scale.setEnabled(True)
+            self.btn_reset_scale.setStyleSheet(
+                "QPushButton { background-color: #D08770; color: white; font-weight: bold; padding: 4px; border-radius: 3px; }"
+                "QPushButton:hover { background-color: #BF616A; }"
+            )
+
+        self.chk_scale_scene_with_view.blockSignals(True)
+        self.chk_scale_scene_with_view.setChecked(self.plugin.data.scale_model_with_view)
+        self.chk_scale_scene_with_view.blockSignals(False)
+
+    def _on_toggle_scale_scene_with_view(self, checked: bool) -> None:
+        self.plugin.data.scale_model_with_view = checked
+        self.plugin.save_state()
+
+    def _on_reset_scale_clicked(self) -> None:
+        ok, msg = self.plugin.reset_to_original_scale()
+        if ok:
+            self.lbl_selected_edge.setText(f"✅ {msg}")
+            self.lbl_selected_edge.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 11px;")
+            self.refresh_ui()
+        else:
+            self.lbl_selected_edge.setText(f"⚠️ {msg}")
+            self.lbl_selected_edge.setStyleSheet("color: #FF5252; font-size: 11px;")
+
     def update_readouts(self, solved: SolvedCameraParams) -> None:
         self.lbl_focal.setText(f"{solved.focal_35mm:.1f} mm (35mm eq.)")
         self.lbl_fov.setText(f"{solved.fov_deg:.1f}°")
@@ -1460,16 +1515,10 @@ class PerspectiveMatcherPanel(QWidget):
         if getattr(self, "_is_internal_scale_sync", False):
             return
 
-        if self.chk_scale_scene_with_view.isChecked():
-            last_dist = getattr(self, "_drag_last_dist", self.plugin.data.distance)
-            if last_dist > 1e-4 and abs(new_dist - last_dist) > 1e-4:
-                factor = new_dist / last_dist
-                self._drag_last_dist = new_dist
-                self.plugin._apply_scale_factor(factor, register_history=False)
-        else:
-            self.plugin.data.distance = new_dist
-            self.plugin.update_camera_from_guides()
-            self.plugin.save_state()
+        # Real-time camera distance feedback
+        self.plugin.data.distance = new_dist
+        self.plugin.update_camera_from_guides()
+        self.plugin.save_state()
 
     def _on_scale_slider_released(self) -> None:
         if self.chk_scale_scene_with_view.isChecked():
@@ -1478,15 +1527,8 @@ class PerspectiveMatcherPanel(QWidget):
             if start_dist is not None and start_dist > 1e-4:
                 total_factor = curr_dist / start_dist
                 if abs(total_factor - 1.0) > 1e-4:
-                    vp = self.plugin.app.viewport
-                    if hasattr(vp, "history"):
-                        try:
-                            cmd = ScaleMatchSceneCommand(total_factor, self.plugin)
-                            cmd._executed = True
-                            vp.history.undo_stack.append(cmd)
-                            vp.history.redo_stack.clear()
-                        except Exception:
-                            pass
+                    self.plugin.data.distance = start_dist
+                    self.plugin.apply_scale_factor(total_factor)
         self.plugin.save_state()
         self._drag_start_dist = None
         self._drag_last_dist = None
@@ -1504,7 +1546,7 @@ class PerspectiveMatcherPanel(QWidget):
             old_dist = self.plugin.data.distance
             if self.chk_scale_scene_with_view.isChecked() and old_dist > 1e-4 and abs(new_dist - old_dist) > 1e-4:
                 factor = new_dist / old_dist
-                self.plugin._apply_scale_factor(factor, register_history=True)
+                self.plugin.apply_scale_factor(factor)
             else:
                 self.plugin.data.distance = new_dist
                 self.plugin.update_camera_from_guides()
@@ -1872,8 +1914,8 @@ class PerspectiveMatcherPlugin:
             return None
         return get_selected_edge_info(scene)
 
-    def _apply_scale_factor(self, factor: float, anchor: Optional[QVector3D] = None, register_history: bool = True) -> bool:
-        """Scales the entire 3D scene geometry, camera distance, and saved views uniformly.
+    def _do_apply_scale_factor(self, factor: float, anchor: Optional[QVector3D] = None) -> bool:
+        """Internal execution of uniform scale mutation across geometry, distance, views, and document state.
         Because camera optical rays scale proportionally around the match origin, the 3D volume
         seen through the perspective match camera remains 100% FIXED on top of the background photo."""
         if abs(factor - 1.0) < 1e-6 or factor <= 1e-6:
@@ -1887,13 +1929,18 @@ class PerspectiveMatcherPlugin:
         if scene is None:
             return False
 
+        old_cumulative = getattr(self.data, "cumulative_scale", 1.0)
+        old_distance = self.data.distance
         self._is_internal_update = True
         try:
-            # 1. Scale entire scene geometry uniformly (meshes, groups, billboards, guides, dimensions)
+            # 1. Scale entire scene geometry uniformly (meshes, groups, billboards, guides, dimensions, image planes)
             scale_scene_geometry(scene, factor, anchor=anchor, viewport=vp)
 
-            # 2. Scale camera distance in PerspectiveMatchData
-            self.data.distance *= factor
+            # 2. Update cumulative scale tracker and distance
+            self.data.cumulative_scale = old_cumulative * factor
+            if abs(self.data.cumulative_scale - 1.0) < 1e-5:
+                self.data.cumulative_scale = 1.0
+            self.data.distance = old_distance * factor
 
             # 3. Scale all cameras in saved_views (both target and distance)
             for v in self.data.saved_views:
@@ -1949,21 +1996,60 @@ class PerspectiveMatcherPlugin:
             except Exception:
                 pass
 
-            # 7. Register undo history if requested
-            if register_history and hasattr(vp, "history"):
-                try:
-                    cmd = ScaleMatchSceneCommand(factor, self, anchor)
-                    cmd._executed = True
-                    vp.history.undo_stack.append(cmd)
-                    vp.history.redo_stack.clear()
-                except Exception:
-                    pass
+            # 7. Refresh scale UI in panel
+            if self.panel is not None:
+                self.panel.refresh_scale_ui()
 
             # 8. Force full viewport redraw
             vp.update()
             return True
+        except Exception:
+            self.data.cumulative_scale = old_cumulative
+            self.data.distance = old_distance
+            raise
         finally:
             self._is_internal_update = False
+
+    def apply_scale_factor(self, factor: float, anchor: Optional[QVector3D] = None) -> bool:
+        """Scales the entire 3D scene geometry, camera distance, and saved views uniformly.
+        Executed through viewport.history.execute for transactional undo/redo and rollback protection."""
+        if abs(factor - 1.0) < 1e-6 or factor <= 1e-6:
+            return False
+
+        if anchor is None:
+            anchor = QVector3D(0.0, 0.0, 0.0)
+
+        vp = self.app.viewport
+        cmd = ScaleMatchSceneCommand(factor, self, anchor)
+        if hasattr(vp, "history") and hasattr(vp.history, "execute"):
+            vp.history.execute(cmd)
+            if getattr(vp.history, "last_error", None):
+                return False
+            return True
+        else:
+            return self._do_apply_scale_factor(factor, anchor)
+
+    def _apply_scale_factor(self, factor: float, anchor: Optional[QVector3D] = None, register_history: bool = True) -> bool:
+        """Backward-compatible wrapper for scale operations."""
+        if register_history:
+            return self.apply_scale_factor(factor, anchor)
+        return self._do_apply_scale_factor(factor, anchor)
+
+    def reset_to_original_scale(self) -> Tuple[bool, str]:
+        """Resets the model geometry, distance, and views back to original scale (1.000×).
+        Reversible via Undo/Redo."""
+        cum_scale = getattr(self.data, "cumulative_scale", 1.0)
+        if abs(cum_scale - 1.0) < 1e-4:
+            return True, _t("Model is already at original scale (1.000×)")
+        if cum_scale <= 1e-6:
+            return False, _t("Invalid cumulative scale value")
+
+        reset_factor = 1.0 / cum_scale
+        ok = self.apply_scale_factor(reset_factor, anchor=QVector3D(0.0, 0.0, 0.0))
+        if ok:
+            msg = _t(f"Reset model to original scale (1.000×) from {cum_scale:.3f}×")
+            return True, msg
+        return False, _t("Failed to reset scale")
 
     def scale_model_to_edge(self, current_len: float, target_len: float) -> Tuple[bool, str]:
         """Scales the entire 3D scene geometry and camera distance to match the real dimension.
@@ -1975,7 +2061,7 @@ class PerspectiveMatcherPlugin:
         if abs(factor - 1.0) < 1e-6:
             return True, "Scale is already 1.0×"
 
-        ok = self._apply_scale_factor(factor, anchor=QVector3D(0.0, 0.0, 0.0), register_history=True)
+        ok = self.apply_scale_factor(factor, anchor=QVector3D(0.0, 0.0, 0.0))
         if ok:
             if self.panel is not None:
                 self.panel.refresh_ui()
@@ -2065,11 +2151,29 @@ class PerspectiveMatcherPlugin:
         tgt_spin.valueChanged.connect(on_spin_changed)
         mult_slider.valueChanged.connect(on_slider_changed)
 
+        cum_scale = getattr(self.data, "cumulative_scale", 1.0)
+        is_mod = abs(cum_scale - 1.0) >= 1e-4
+        scale_status_lbl = QLabel(
+            f"{_t('Current Model Scale:')} {cum_scale:.3f}× ({_t('Modified') if is_mod else _t('Original')})"
+        )
+        scale_status_lbl.setStyleSheet("color: #EBCB8B; font-weight: bold; font-size: 11px;" if is_mod else "color: #88C0D0; font-size: 11px;")
+        lay.addWidget(scale_status_lbl)
+
         btn_row = QHBoxLayout()
         apply_btn = QPushButton(_t("Apply Scale"))
         apply_btn.setStyleSheet("background-color: #007ACC; color: white; font-weight: bold; padding: 7px; border-radius: 3px;")
-        cancel_btn = QPushButton(_t("Cancel"))
         btn_row.addWidget(apply_btn)
+
+        if is_mod:
+            reset_btn = QPushButton(_t("🔄 Reset to Original"))
+            reset_btn.setStyleSheet("background-color: #D08770; color: white; font-weight: bold; padding: 7px; border-radius: 3px;")
+            def on_reset():
+                self.reset_to_original_scale()
+                dlg.accept()
+            reset_btn.clicked.connect(on_reset)
+            btn_row.addWidget(reset_btn)
+
+        cancel_btn = QPushButton(_t("Cancel"))
         btn_row.addWidget(cancel_btn)
         lay.addLayout(btn_row)
 

@@ -7,7 +7,7 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/seghier/IngeTrazoPerspectiveMatcher"
 
 download = "https://github.com/seghier/IngeTrazoPerspectiveMatcher/releases/download/v1.0/perspective_matcher.zip"
-sha256 = "fba3b9326ecfd31a9c33546c97ebbf42e5b9be3c6539ad6c2f1871884a2d4eef"
+sha256 = "042e4b96a94b756eda9aabe550ee092f45a1b53466f999ce6bec2a5881c2e5bd"
 
 ingetrazo = "0.5.7"
 tags = ["architecture", "drawing", "productivity"]
@@ -17,5 +17,5 @@ en = "Perspective Matcher"
 es = "Ajuste de Perspectiva"
 
 [summary]
-en = "Match 3D viewport camera to architectural photographs with interactive vanishing lines (SketchUp / Blender style)."
-es = "Ajusta la cámara 3D a fotografías arquitectónicas con líneas de fuga interactivas (estilo SketchUp y Blender)."
+en = "Match 3D viewport camera to architectural photographs with interactive vanishing lines."
+es = "Ajusta la cámara 3D a fotografías arquitectónicas con líneas de fuga interactivas."

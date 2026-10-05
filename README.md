@@ -19,7 +19,12 @@
 * **🏢 2-Point & 3-Point Modes**:
   * **2-Point Perspective**: Keeps verticals perfectly vertical (architectural standard).
   * **3-Point Perspective**: For photos with tilted or drone camera angles.
-* **💾 Document Integration**: Calibration, photo path, and guide handles are saved directly inside your IngeTrazo document (`.igz`).
+* **📏 Non-Destructive Scaling & Quantity Protection**:
+  * **"Scale Model with View (Fixed on Photo)" is OFF by default** to safeguard user model dimensions and quantity takeoffs.
+  * Adjusting the scale slider freely changes camera distance without altering model measurements.
+  * When explicitly enabled, uniform scaling executes safely through IngeTrazo's transactional command history (`viewport.history.execute`) with automatic rollback protection.
+  * **Remembers Original Scale**: Tracks baseline scale across sessions (saved directly into `.igz`), allowing you to restore the model at any time with the **"🔄 Reset to Original"** button.
+* **💾 Document Integration**: Calibration, photo path, cumulative scale, and guide handles are saved directly inside your IngeTrazo document (`.igz`).
 
 ---
 
@@ -40,8 +45,9 @@
    * Red handles on horizontal edges pointing along the X axis.
    * Green handles on horizontal edges pointing along the Y axis.
 4. Drag the orange **Origin Handle** to the corner of the building where you want $(0, 0, 0)$ located.
-5. Set the **Camera Distance** to scale the model to real-world dimensions.
-6. Check **"Lock Viewport Camera"** once satisfied to keep the view fixed while modeling.
+5. Calibrate dimensions using **"Read Edge"** / **"Apply Scale"**, or adjust **Match Scale** slider.
+6. If needed, click **"🔄 Reset to Original"** at any time to return the model to its original dimensions.
+7. Click **"🔒 Lock"** once satisfied to freeze the camera while modeling.
 
 ---
 
