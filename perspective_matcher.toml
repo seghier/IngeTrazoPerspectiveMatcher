@@ -1,0 +1,21 @@
+id = "perspective_matcher"
+version = "1.0"
+author = "Seghier Mohamed Abdellatif"
+author_url = "https://github.com/seghier"
+
+license = "GPL-3.0-or-later"
+repository = "https://github.com/seghier/IngeTrazoPerspectiveMatcher"
+
+download = "https://raw.githubusercontent.com/seghier/IngeTrazoPerspectiveMatcher/v1.0/perspective_matcher.py"
+sha256 = "4bd56f52e6ccafc07305dab82b2276e621766211fe9b4635b93edb4bf10ee000"
+
+ingetrazo = "0.5.7"
+tags = ["architecture", "drawing", "productivity"]
+
+[name]
+en = "Perspective Matcher"
+es = "Ajuste de Perspectiva"
+
+[summary]
+en = "Match 3D viewport camera to architectural photographs with interactive vanishing lines (SketchUp / Blender style)."
+es = "Ajusta la cámara 3D a fotografías arquitectónicas con líneas de fuga interactivas (estilo SketchUp y Blender)."
