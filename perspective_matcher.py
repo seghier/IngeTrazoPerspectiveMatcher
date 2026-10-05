@@ -798,8 +798,8 @@ class PerspectiveEventFilter(QObject):
                 if self.plugin.data.enabled:
                     vp.update()
 
-        # If perspective match is disabled, leave viewport interactions 100% untouched
-        if not self.plugin.data.enabled:
+        # If perspective match is disabled and camera is not locked, leave viewport interactions 100% untouched
+        if not self.plugin.data.enabled and not self.plugin.data.camera_locked:
             return False
 
         # 2. Top Scene Tabs Bar Interactions (When Match is Enabled)
@@ -855,7 +855,64 @@ class PerspectiveEventFilter(QObject):
                 vp.update()
                 return True
 
-        # 3. Handle 3D Orbit Camera Tracking (when in Perspective / Orbit tabs)
+        # 3. Camera Lock Enforcement (Blocks Orbit, Pan, Zoom, and Rotation)
+        if self.plugin.data.camera_locked:
+            # Enforce camera immutability if camera drifted
+            if self.plugin.locked_camera_state is not None and hasattr(vp, "camera"):
+                cur = get_camera_state(vp.camera)
+                if (cur.get("yaw") != self.plugin.locked_camera_state.get("yaw") or
+                    cur.get("pitch") != self.plugin.locked_camera_state.get("pitch") or
+                    cur.get("distance") != self.plugin.locked_camera_state.get("distance") or
+                    cur.get("target") != self.plugin.locked_camera_state.get("target")):
+                    apply_camera_state(vp.camera, self.plugin.locked_camera_state)
+                    vp.update()
+
+            # Block mouse wheel zoom
+            if t == QEvent.Wheel:
+                self.plugin._show_status_message(_t("🔒 Camera is locked. Click 'Locked' in panel to unlock."), 2500)
+                return True
+
+            # Block Middle Mouse button orbit and pan
+            if t in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease, QEvent.MouseMove, QEvent.MouseButtonDblClick):
+                btn = getattr(event, "button", None)
+                btns = getattr(event, "buttons", None)
+                is_mid = False
+                if callable(btn):
+                    is_mid = (btn() == Qt.MiddleButton)
+                elif isinstance(btn, Qt.MouseButton):
+                    is_mid = (btn == Qt.MiddleButton)
+                if not is_mid and callable(btns):
+                    is_mid = bool(btns() & Qt.MiddleButton)
+                elif not is_mid and isinstance(btns, Qt.MouseButtons):
+                    is_mid = bool(btns & Qt.MiddleButton)
+
+                if is_mid:
+                    if t == QEvent.MouseButtonPress:
+                        self.plugin._show_status_message(_t("🔒 Camera is locked. Click 'Locked' in panel to unlock."), 2500)
+                    return True
+
+            # Block viewport navigation tools (Orbit, Pan, Zoom, Look, Walk)
+            nav = getattr(vp, "nav_mode", None)
+            if nav in ("orbit", "pan", "zoom", "zoom_window", "look", "walk"):
+                if t in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease, QEvent.MouseMove, QEvent.MouseButtonDblClick):
+                    if t == QEvent.MouseButtonPress:
+                        self.plugin._show_status_message(_t("🔒 Camera is locked. Click 'Locked' in panel to unlock."), 2500)
+                    return True
+
+            # In Match tab, if user attempts to click a guide handle while locked, notify them
+            is_match_tab_check = (
+                self.plugin.data.active_view_index < len(self.plugin.data.saved_views)
+                and self.plugin.data.saved_views[self.plugin.data.active_view_index].get("type") == "match"
+            )
+            if is_match_tab_check and self.plugin.data.show_guides:
+                if t == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                    pos = event.position() if hasattr(event, "position") else QPointF(event.pos())
+                    hit = self._hit_test(pos.x(), pos.y(), vp.width(), vp.height())
+                    if hit is not None:
+                        self.plugin._show_status_message(_t("🔒 Camera is locked. Click 'Locked' in panel to unlock."), 2500)
+                        return True
+
+        # 4. Handle 3D Orbit Camera Tracking (when in Perspective / Orbit tabs)
         is_match_tab = (
             self.plugin.data.active_view_index < len(self.plugin.data.saved_views)
             and self.plugin.data.saved_views[self.plugin.data.active_view_index].get("type") == "match"
@@ -999,10 +1056,14 @@ class PerspectiveMatcherPanel(QWidget):
         self.btn_add_view.clicked.connect(self._on_add_view)
         self.btn_update_view = QPushButton(_t("Update Camera"))
         self.btn_update_view.clicked.connect(self._on_update_view)
+        self.btn_lock_cam = QPushButton(_t("🔒 Lock"))
+        self.btn_lock_cam.setToolTip(_t("Lock camera so it cannot move, rotate, or zoom."))
+        self.btn_lock_cam.clicked.connect(self._on_lock_cam_clicked)
         self.btn_del_view = QPushButton(_t("Delete"))
         self.btn_del_view.clicked.connect(self._on_delete_view)
         views_btn_row.addWidget(self.btn_add_view)
         views_btn_row.addWidget(self.btn_update_view)
+        views_btn_row.addWidget(self.btn_lock_cam)
         views_btn_row.addWidget(self.btn_del_view)
         scenes_lay.addLayout(views_btn_row)
 
@@ -1275,6 +1336,19 @@ class PerspectiveMatcherPanel(QWidget):
                   self.chk_inv_z, self.chk_swap_xy, self.combo_mode):
             w.blockSignals(False)
 
+        if hasattr(self, "btn_lock_cam"):
+            if self.plugin.data.camera_locked:
+                self.btn_lock_cam.setText(_t("🔒 Locked"))
+                self.btn_lock_cam.setToolTip(_t("Camera is locked (cannot move, rotate, or zoom). Click to unlock."))
+                self.btn_lock_cam.setStyleSheet(
+                    "QPushButton { background-color: #E65100; color: #FFFFFF; font-weight: bold; border-radius: 4px; padding: 4px 8px; }"
+                    "QPushButton:hover { background-color: #F57C00; }"
+                )
+            else:
+                self.btn_lock_cam.setText(_t("🔓 Lock"))
+                self.btn_lock_cam.setToolTip(_t("Lock camera so it cannot move, rotate, or zoom."))
+                self.btn_lock_cam.setStyleSheet("")
+
     def update_readouts(self, solved: SolvedCameraParams) -> None:
         self.lbl_focal.setText(f"{solved.focal_35mm:.1f} mm (35mm eq.)")
         self.lbl_fov.setText(f"{solved.fov_deg:.1f}°")
@@ -1362,9 +1436,11 @@ class PerspectiveMatcherPanel(QWidget):
         self.plugin.app.viewport.update()
         self.plugin.save_state()
 
+    def _on_lock_cam_clicked(self) -> None:
+        self._on_toggle_lock_cam(not self.plugin.data.camera_locked)
+
     def _on_toggle_lock_cam(self, checked: bool) -> None:
-        self.plugin.data.camera_locked = checked
-        self.plugin.save_state()
+        self.plugin.set_camera_locked(checked)
 
     def _on_mode_changed(self) -> None:
         self.plugin.data.mode = self.combo_mode.currentData()
@@ -1490,10 +1566,42 @@ class PerspectiveMatcherPlugin:
         # Load persisted document data
         self.load_state_from_document()
 
+        self.locked_camera_state: Optional[Dict[str, Any]] = None
+        if self.data.camera_locked:
+            vp = getattr(self.app, "viewport", None)
+            if vp is not None and hasattr(vp, "camera"):
+                self.locked_camera_state = get_camera_state(vp.camera)
+
         self.panel: Optional[PerspectiveMatcherPanel] = None
         self.panel = PerspectiveMatcherPanel(self)
         self.filter = PerspectiveEventFilter(self)
         app.viewport.installEventFilter(self.filter)
+
+    def _show_status_message(self, msg: str, timeout: int = 3000) -> None:
+        try:
+            win = getattr(self.app, "window", None)
+            if win is not None and hasattr(win, "statusBar"):
+                sb = win.statusBar()
+                if sb is not None:
+                    sb.showMessage(msg, timeout)
+        except Exception:
+            pass
+
+    def set_camera_locked(self, locked: bool) -> None:
+        self.data.camera_locked = bool(locked)
+        vp = getattr(self.app, "viewport", None)
+        if locked:
+            if vp is not None and hasattr(vp, "camera"):
+                self.locked_camera_state = get_camera_state(vp.camera)
+            self._show_status_message(_t("🔒 Camera locked (movement & rotation frozen)."), 3000)
+        else:
+            self.locked_camera_state = None
+            self._show_status_message(_t("🔓 Camera unlocked."), 2000)
+        self.save_state()
+        if self.panel is not None:
+            self.panel.refresh_ui()
+        if vp is not None:
+            vp.update()
 
     def load_state_from_document(self) -> None:
         """Loads perspective match configuration and restores photo without resetting existing state."""
@@ -1693,6 +1801,11 @@ class PerspectiveMatcherPlugin:
                 cam.up = QVector3D(0.0, 0.0, 1.0)
                 cam.two_point = False
 
+        if self.data.camera_locked:
+            vp = getattr(self.app, "viewport", None)
+            if vp is not None and hasattr(vp, "camera"):
+                self.locked_camera_state = get_camera_state(vp.camera)
+
         self.save_state()
         if self.panel is not None:
             self.panel.refresh_ui()
@@ -1720,6 +1833,8 @@ class PerspectiveMatcherPlugin:
         else:
             cam = self.app.viewport.camera
             self.data.saved_views[idx]["camera"] = get_camera_state(cam)
+            if self.data.camera_locked:
+                self.locked_camera_state = get_camera_state(cam)
             self.save_state()
             self.app.viewport.update()
 
@@ -1818,6 +1933,9 @@ class PerspectiveMatcherPlugin:
                 cam.distance *= factor
                 new_t = anchor + (cam.target - anchor) * factor
                 cam.target = new_t
+
+            if self.data.camera_locked:
+                self.locked_camera_state = get_camera_state(cam)
 
             # 6. Save state to document
             payload = self.data.to_dict()
@@ -1995,6 +2113,8 @@ class PerspectiveMatcherPlugin:
             cam.up = QVector3D(0.0, 0.0, 1.0)
             cam.two_point = True
         cam.look_from(self.solved.eye, self.solved.forward)
+        if self.data.camera_locked:
+            self.locked_camera_state = get_camera_state(cam)
         vp.update()
 
     def _draw_scene_tabs(self, viewport, painter: QPainter) -> None:
@@ -2213,6 +2333,17 @@ class PerspectiveMatcherPlugin:
     def _safe_draw_overlay(self, viewport, painter: QPainter) -> None:
         if not self.data.enabled:
             return
+
+        # Enforce camera immutability when locked
+        if self.data.camera_locked and self.locked_camera_state is not None:
+            cam = getattr(viewport, "camera", None)
+            if cam is not None:
+                cur = get_camera_state(cam)
+                if (cur.get("yaw") != self.locked_camera_state.get("yaw") or
+                    cur.get("pitch") != self.locked_camera_state.get("pitch") or
+                    cur.get("distance") != self.locked_camera_state.get("distance") or
+                    cur.get("target") != self.locked_camera_state.get("target")):
+                    apply_camera_state(cam, self.locked_camera_state)
 
         w = max(viewport.width(), 100)
         h = max(viewport.height(), 100)
