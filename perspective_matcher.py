@@ -86,15 +86,18 @@ def get_selected_edge_info(scene) -> Optional[Tuple[float, str]]:
         return None
 
     # 1. Direct Edge entities
-    edges = [e for e in scene.selection if hasattr(e, "a") and hasattr(e, "b")]
+    edges = [e for e in scene.selection if hasattr(e, "length") or (hasattr(e, "a") and hasattr(e, "b"))]
     if edges:
         e = edges[0]
-        p1 = QVector3D(e.a.x(), e.a.y(), e.a.z()) if hasattr(e.a, "x") else QVector3D(e.a)
-        p2 = QVector3D(e.b.x(), e.b.y(), e.b.z()) if hasattr(e.b, "x") else QVector3D(e.b)
-        dx = float(p2.x() - p1.x())
-        dy = float(p2.y() - p1.y())
-        dz = float(p2.z() - p1.z())
-        length = math.hypot(dx, dy, dz)
+        if hasattr(e, "length") and callable(e.length):
+            length = float(e.length())
+        else:
+            p1 = QVector3D(e.a.x(), e.a.y(), e.a.z()) if hasattr(e.a, "x") else QVector3D(e.a)
+            p2 = QVector3D(e.b.x(), e.b.y(), e.b.z()) if hasattr(e.b, "x") else QVector3D(e.b)
+            dx = float(p2.x() - p1.x())
+            dy = float(p2.y() - p1.y())
+            dz = float(p2.z() - p1.z())
+            length = math.hypot(dx, dy, dz)
         return (length, f"Edge ({length:.3f} m)")
 
     # 2. Two selected vertices or guide points
@@ -114,38 +117,55 @@ def get_selected_edge_info(scene) -> Optional[Tuple[float, str]]:
         length = math.hypot(dx, dy, dz)
         return (length, f"2 Points ({length:.3f} m)")
 
+    # 3. Single selected Group/Component or Face
+    if len(scene.selection) == 1:
+        ent = next(iter(scene.selection))
+        if hasattr(ent, "bounds") and callable(ent.bounds):
+            try:
+                b_min, b_max = ent.bounds()
+                dx = float(b_max.x() - b_min.x())
+                dy = float(b_max.y() - b_min.y())
+                dz = float(b_max.z() - b_min.z())
+                diag = math.hypot(dx, dy, dz)
+                if diag > 1e-4:
+                    return (diag, f"Object Bounding Box ({diag:.3f} m)")
+            except Exception:
+                pass
+
     return None
 
 
 def scale_scene_geometry(scene, factor: float) -> None:
-    """Scales all geometry in scene (loose mesh and groups) around origin (0, 0, 0)."""
+    """Scales all geometry in scene (loose mesh and groups) around origin (0, 0, 0).
+    Properly updates mesh registry and chunk dirty flags via place_vertex."""
     if scene is None or abs(factor - 1.0) < 1e-7:
         return
 
-    # Scale loose mesh vertices
+    # 1. Scale loose mesh vertices using place_vertex for registry integrity
     if hasattr(scene, "mesh") and scene.mesh is not None:
         mesh = scene.mesh
         if hasattr(mesh, "vertices"):
-            for v in mesh.vertices:
-                if hasattr(v, "position"):
+            for v in list(mesh.vertices):
+                if hasattr(v, "position") and hasattr(v.position, "x"):
                     pos = v.position
-                    if hasattr(pos, "x"):
-                        v.position = QVector3D(
-                            float(pos.x()) * factor,
-                            float(pos.y()) * factor,
-                            float(pos.z()) * factor
-                        )
-                elif hasattr(v, "x") and hasattr(v, "setX"):
-                    v.setX(float(v.x()) * factor)
-                    v.setY(float(v.y()) * factor)
-                    v.setZ(float(v.z()) * factor)
+                    new_pos = QVector3D(
+                        float(pos.x()) * factor,
+                        float(pos.y()) * factor,
+                        float(pos.z()) * factor
+                    )
+                    if hasattr(mesh, "place_vertex"):
+                        mesh.place_vertex(v, new_pos)
+                    else:
+                        v.position = new_pos
+            if hasattr(mesh, "_chunk_dirty"):
+                mesh._chunk_dirty = True
 
-    # Scale groups (groups/components)
+    # 2. Scale groups (groups/components)
     if hasattr(scene, "groups") and scene.groups:
         for g in scene.groups:
             _scale_group_recursive(g, factor)
 
-    # Scale guide points if present
+    # 3. Scale guide points and segments if present
     if hasattr(scene, "guides") and scene.guides:
         for guide in scene.guides:
             if hasattr(guide, "point") and hasattr(guide.point, "x"):
@@ -155,6 +175,33 @@ def scale_scene_geometry(scene, factor: float) -> None:
                     float(p.y()) * factor,
                     float(p.z()) * factor
                 )
+            if hasattr(guide, "origin") and guide.origin is not None and hasattr(guide.origin, "x"):
+                orig = guide.origin
+                guide.origin = QVector3D(
+                    float(orig.x()) * factor,
+                    float(orig.y()) * factor,
+                    float(orig.z()) * factor
+                )
+
+    # 4. Scale dimensions if present
+    if hasattr(scene, "dimensions") and scene.dimensions:
+        for dim in scene.dimensions:
+            if hasattr(dim, "_a") and hasattr(dim._a, "x"):
+                dim._a = QVector3D(float(dim._a.x()) * factor, float(dim._a.y()) * factor, float(dim._a.z()) * factor)
+            if hasattr(dim, "_b") and hasattr(dim._b, "x"):
+                dim._b = QVector3D(float(dim._b.x()) * factor, float(dim._b.y()) * factor, float(dim._b.z()) * factor)
+            if hasattr(dim, "offset") and hasattr(dim.offset, "x"):
+                dim.offset = QVector3D(float(dim.offset.x()) * factor, float(dim.offset.y()) * factor, float(dim.offset.z()) * factor)
+
+    # 5. Scale image planes if present
+    if hasattr(scene, "image_planes") and scene.image_planes:
+        for im in scene.image_planes:
+            if hasattr(im, "origin") and hasattr(im.origin, "x"):
+                im.origin = QVector3D(float(im.origin.x()) * factor, float(im.origin.y()) * factor, float(im.origin.z()) * factor)
+            if hasattr(im, "u") and hasattr(im.u, "x"):
+                im.u = QVector3D(float(im.u.x()) * factor, float(im.u.y()) * factor, float(im.u.z()) * factor)
+            if hasattr(im, "v") and hasattr(im.v, "x"):
+                im.v = QVector3D(float(im.v.x()) * factor, float(im.v.y()) * factor, float(im.v.z()) * factor)
 
     if hasattr(scene, "version"):
         scene.version += 1
@@ -169,15 +216,20 @@ def _scale_group_recursive(group, factor: float) -> None:
     elif hasattr(group, "mesh") and group.mesh is not None:
         mesh = group.mesh
         if hasattr(mesh, "vertices"):
-            for v in mesh.vertices:
-                if hasattr(v, "position"):
+            for v in list(mesh.vertices):
+                if hasattr(v, "position") and hasattr(v.position, "x"):
                     pos = v.position
-                    if hasattr(pos, "x"):
-                        v.position = QVector3D(
-                            float(pos.x()) * factor,
-                            float(pos.y()) * factor,
-                            float(pos.z()) * factor
-                        )
+                    new_pos = QVector3D(
+                        float(pos.x()) * factor,
+                        float(pos.y()) * factor,
+                        float(pos.z()) * factor
+                    )
+                    if hasattr(mesh, "place_vertex"):
+                        mesh.place_vertex(v, new_pos)
+                    else:
+                        v.position = new_pos
+            if hasattr(mesh, "_chunk_dirty"):
+                mesh._chunk_dirty = True
 
     if hasattr(group, "children") and group.children:
         for child in group.children:
@@ -617,7 +669,7 @@ class PerspectiveEventFilter(QObject):
 
         if not is_match_tab:
             # User is orbiting in standard 3D perspective view
-            if t == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+            if t == QEvent.MouseButtonRelease and event.button() in (Qt.LeftButton, Qt.MiddleButton, Qt.RightButton):
                 curr_idx = self.plugin.data.active_view_index
                 if 0 <= curr_idx < len(self.plugin.data.saved_views):
                     self.plugin.data.saved_views[curr_idx]["camera"] = get_camera_state(vp.camera)
@@ -1138,6 +1190,7 @@ class PerspectiveMatcherPlugin:
 
     def __init__(self, app) -> None:
         self.app = app
+        self._is_internal_update: bool = False
         self.data = PerspectiveMatchData()
         self.pixmap: Optional[QPixmap] = None
         self.solved = SolvedCameraParams()
@@ -1166,7 +1219,10 @@ class PerspectiveMatcherPlugin:
                 saved = None
 
         if saved and isinstance(saved, dict):
+            currently_enabled = self.data.enabled
             self.data.from_dict(saved)
+            if currently_enabled:
+                self.data.enabled = True
             self._restore_photo()
 
     def _restore_photo(self) -> None:
@@ -1186,6 +1242,8 @@ class PerspectiveMatcherPlugin:
 
     def on_document_changed(self) -> None:
         """Callback invoked whenever an existing document is opened or updated."""
+        if getattr(self, "_is_internal_update", False):
+            return
         self.load_state_from_document()
         if self.panel is not None:
             self.panel.refresh_ui()
@@ -1220,14 +1278,22 @@ class PerspectiveMatcherPlugin:
 
     def save_state(self) -> None:
         """Serializes plugin data into document undo history and direct plugin_data."""
-        payload = self.data.to_dict()
-        self.app.set_document_data(payload)
+        if getattr(self, "_is_internal_update", False):
+            return
+        self._is_internal_update = True
         try:
-            if not hasattr(self.app.scene, "plugin_data") or self.app.scene.plugin_data is None:
-                self.app.scene.plugin_data = {}
-            self.app.scene.plugin_data[self.app.key] = payload
-        except Exception:
-            pass
+            payload = self.data.to_dict()
+            self.app.set_document_data(payload)
+            try:
+                sc = getattr(self.app, "scene", None) or getattr(self.app.viewport, "scene", None)
+                if sc is not None:
+                    if not hasattr(sc, "plugin_data") or sc.plugin_data is None:
+                        sc.plugin_data = {}
+                    sc.plugin_data[self.app.key] = payload
+            except Exception:
+                pass
+        finally:
+            self._is_internal_update = False
 
     def toggle_enabled(self, state: Optional[bool] = None) -> None:
         """Toggles perspective match mode on or off."""
@@ -1351,27 +1417,80 @@ class PerspectiveMatcherPlugin:
 
         vp = self.app.viewport
         scene = getattr(vp, "scene", None)
+        if scene is None:
+            return False, "No active scene"
 
-        def mutate(sc):
-            scale_scene_geometry(sc, factor)
-
-        executed = False
+        self._is_internal_update = True
         try:
-            from core.history import SnapshotImport
-            cmd = SnapshotImport(mutate)
-            vp.history.execute(cmd)
-            executed = True
-        except Exception:
-            pass
+            # 1. Scale scene geometry
+            def mutate(sc):
+                scale_scene_geometry(sc, factor)
 
-        if not executed and scene is not None:
-            mutate(scene)
+            executed = False
+            try:
+                from core.history import SnapshotImport
+                cmd = SnapshotImport(mutate)
+                vp.history.execute(cmd)
+                executed = True
+            except Exception:
+                pass
 
-        # Scale camera distance to perfectly preserve 2D projection
-        self.data.distance *= factor
-        self.update_camera_from_guides()
-        self.save_state()
-        vp.update()
+            if not executed:
+                mutate(scene)
+
+            # 2. Scale camera distance in PerspectiveMatchData
+            self.data.distance *= factor
+
+            # 3. Scale all cameras in saved_views (both target and distance)
+            for v in self.data.saved_views:
+                cam_state = v.get("camera")
+                if isinstance(cam_state, dict):
+                    if "distance" in cam_state:
+                        cam_state["distance"] = float(cam_state["distance"]) * factor
+                    if "target" in cam_state and isinstance(cam_state["target"], list) and len(cam_state["target"]) == 3:
+                        cam_state["target"] = [
+                            float(cam_state["target"][0]) * factor,
+                            float(cam_state["target"][1]) * factor,
+                            float(cam_state["target"][2]) * factor,
+                        ]
+
+            # 4. Re-solve perspective with updated distance
+            w, h = max(vp.width(), 100), max(vp.height(), 100)
+            self.solved = solve_perspective(self.data, w, h)
+            if self.panel is not None:
+                self.panel.update_readouts(self.solved)
+
+            # 5. Apply directly to live viewport camera
+            is_match_tab = (
+                self.data.active_view_index < len(self.data.saved_views)
+                and self.data.saved_views[self.data.active_view_index].get("type") == "match"
+            )
+            if is_match_tab or self.data.enabled:
+                cam = vp.camera
+                cam.fov_deg = self.solved.fov_deg
+                cam.distance = self.data.distance
+                cam.look_from(self.solved.eye, self.solved.forward)
+                cam.two_point = (self.data.mode == "2point")
+            else:
+                cam = vp.camera
+                cam.distance *= factor
+                cam.target = QVector3D(cam.target.x() * factor, cam.target.y() * factor, cam.target.z() * factor)
+
+            # 6. Save state to document
+            payload = self.data.to_dict()
+            self.app.set_document_data(payload)
+            try:
+                sc = getattr(self.app, "scene", None) or getattr(self.app.viewport, "scene", None)
+                if sc is not None:
+                    if not hasattr(sc, "plugin_data") or sc.plugin_data is None:
+                        sc.plugin_data = {}
+                    sc.plugin_data[self.app.key] = payload
+            except Exception:
+                pass
+
+            vp.update()
+        finally:
+            self._is_internal_update = False
 
         msg = f"Scaled by {factor:.3f}×. Edge is now {target_len:.3f} m (Match preserved)"
         return True, msg
