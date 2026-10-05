@@ -55,6 +55,12 @@ def get_camera_state(cam) -> Dict[str, Any]:
         state["two_point"] = bool(cam.two_point)
     if hasattr(cam, "perspective"):
         state["perspective"] = bool(cam.perspective)
+    if hasattr(cam, "up"):
+        u = cam.up
+        if hasattr(u, "x"):
+            state["up"] = [float(u.x()), float(u.y()), float(u.z())]
+        elif isinstance(u, (list, tuple)) and len(u) == 3:
+            state["up"] = [float(u[0]), float(u[1]), float(u[2])]
     return state
 
 
@@ -77,6 +83,11 @@ def apply_camera_state(cam, state: Dict[str, Any]) -> None:
         cam.two_point = bool(state["two_point"])
     if "perspective" in state:
         cam.perspective = bool(state["perspective"])
+    if "up" in state and isinstance(state["up"], (list, tuple)) and len(state["up"]) == 3:
+        u = state["up"]
+        cam.up = QVector3D(float(u[0]), float(u[1]), float(u[2]))
+    else:
+        cam.up = QVector3D(0.0, 0.0, 1.0)
 
 
 # ---- Real-World Scale & Geometry Manipulation Helpers ----------------------
@@ -348,9 +359,9 @@ class PerspectiveMatchData:
         self.y2_a = [0.62, 0.65]
         self.y2_b = [0.82, 0.74]
 
-        self.z1_a = [0.38, 0.25]
+        self.z1_a = [0.40, 0.22]
         self.z1_b = [0.38, 0.72]
-        self.z2_a = [0.62, 0.25]
+        self.z2_a = [0.60, 0.22]
         self.z2_b = [0.62, 0.72]
 
         self.origin = [0.50, 0.72]
@@ -459,6 +470,7 @@ class SolvedCameraParams:
         self.eye: QVector3D = QVector3D(15.0, 15.0, 10.0)
         self.target: QVector3D = QVector3D(0.0, 0.0, 0.0)
         self.forward: QVector3D = QVector3D(-0.7, -0.7, -0.3)
+        self.up_w: QVector3D = QVector3D(0.0, 0.0, 1.0)
         self.v_x_cam: List[float] = [1.0, 0.0, 0.0]
         self.v_y_cam: List[float] = [0.0, 1.0, 0.0]
         self.v_z_cam: List[float] = [0.0, 0.0, 1.0]
@@ -468,12 +480,72 @@ class SolvedCameraParams:
         self.horizon: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None
 
 
+def mat3_inv(m: List[List[float]]) -> Optional[List[List[float]]]:
+    """Inverts a 3x3 matrix using Cramer's rule. Returns None if singular."""
+    det = (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+           m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+           m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
+    if abs(det) < 1e-12:
+        return None
+    invdet = 1.0 / det
+    return [
+        [(m[1][1] * m[2][2] - m[1][2] * m[2][1]) * invdet,
+         (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * invdet,
+         (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * invdet],
+        [(m[1][2] * m[2][0] - m[1][0] * m[2][2]) * invdet,
+         (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * invdet,
+         (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * invdet],
+        [(m[1][0] * m[2][1] - m[1][1] * m[2][0]) * invdet,
+         (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * invdet,
+         (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * invdet],
+    ]
+
+
+def nearest_rotation_matrix(m: List[List[float]]) -> List[List[float]]:
+    """Finds the nearest orthogonal rotation matrix R in SO(3) via polar decomposition.
+    Uses numpy SVD if available; otherwise falls back to pure-Python Newton polar iteration."""
+    try:
+        import numpy as np
+        M = np.array(m, dtype=float)
+        U, _, Vt = np.linalg.svd(M)
+        d = np.linalg.det(U @ Vt)
+        R = U @ np.diag([1.0, 1.0, d]) @ Vt
+        return R.tolist()
+    except Exception:
+        pass
+
+    cur = [row[:] for row in m]
+    for _ in range(8):
+        inv = mat3_inv(cur)
+        if inv is None:
+            break
+        next_m = [[0.0] * 3 for _ in range(3)]
+        diff = 0.0
+        for i in range(3):
+            for j in range(3):
+                val = 0.5 * (cur[i][j] + inv[j][i])
+                diff = max(diff, abs(val - cur[i][j]))
+                next_m[i][j] = val
+        cur = next_m
+        if diff < 1e-7:
+            break
+
+    det = (cur[0][0] * (cur[1][1] * cur[2][2] - cur[1][2] * cur[2][1]) -
+           cur[0][1] * (cur[1][0] * cur[2][2] - cur[1][2] * cur[2][0]) +
+           cur[0][2] * (cur[1][0] * cur[2][1] - cur[1][1] * cur[2][0]))
+    if det < 0:
+        for i in range(3):
+            cur[i][2] = -cur[i][2]
+    return cur
+
+
 def solve_perspective(
     data: PerspectiveMatchData,
     view_width: float,
     view_height: float
 ) -> SolvedCameraParams:
-    """Solves focal length, FOV, camera rotation, and eye position from guides."""
+    """Solves focal length, FOV, camera rotation, and eye position from guides.
+    Supports both 2-point mode and full 3-point perspective with active Z-axis influence."""
     res = SolvedCameraParams()
     W, H = max(view_width, 100.0), max(view_height, 100.0)
     cx, cy = W / 2.0, H / 2.0
@@ -487,16 +559,15 @@ def solve_perspective(
     p_y1_a, p_y1_b = to_px(data.y1_a), to_px(data.y1_b)
     p_y2_a, p_y2_b = to_px(data.y2_a), to_px(data.y2_b)
 
+    p_z1_a, p_z1_b = to_px(data.z1_a), to_px(data.z1_b)
+    p_z2_a, p_z2_b = to_px(data.z2_a), to_px(data.z2_b)
+
     # Calculate 2D vanishing points
     vp_x = intersect_lines_2d(p_x1_a, p_x1_b, p_x2_a, p_x2_b)
     vp_y = intersect_lines_2d(p_y1_a, p_y1_b, p_y2_a, p_y2_b)
+    vp_z = intersect_lines_2d(p_z1_a, p_z1_b, p_z2_a, p_z2_b)
     res.vp_x = vp_x
     res.vp_y = vp_y
-
-    # Calculate Z vanishing point (in 3-point mode)
-    p_z1_a, p_z1_b = to_px(data.z1_a), to_px(data.z1_b)
-    p_z2_a, p_z2_b = to_px(data.z2_a), to_px(data.z2_b)
-    vp_z = intersect_lines_2d(p_z1_a, p_z1_b, p_z2_a, p_z2_b)
     res.vp_z = vp_z
 
     if vp_x is None or vp_y is None:
@@ -509,16 +580,43 @@ def solve_perspective(
     du_y = vp_y[0] - cx
     dv_y = -(vp_y[1] - cy)
 
-    # Vanishing Point Orthogonality condition:
-    dot_prod = du_x * du_y + dv_x * dv_y
+    dot_xy = du_x * du_y + dv_x * dv_y
 
-    if dot_prod >= -1.0:
-        res.status_msg = _t("Invalid vanishing point configuration")
-        f = (H / 2.0) / math.tan(math.radians(45.0) / 2.0)
+    # Solve focal length f
+    if data.mode == "3point" and vp_z is not None:
+        du_z = vp_z[0] - cx
+        dv_z = -(vp_z[1] - cy)
+        dot_yz = du_y * du_z + dv_y * dv_z
+        dot_zx = du_z * du_x + dv_z * du_x  # du_z * du_x + dv_z * dv_x
+        dot_zx = du_z * du_x + dv_z * dv_x
+
+        cands: List[float] = []
+        if dot_xy < -1.0:
+            cands.append(-dot_xy)
+        if dot_yz < -1.0:
+            cands.append(-dot_yz)
+        if dot_zx < -1.0:
+            cands.append(-dot_zx)
+
+        if cands:
+            f = math.sqrt(sum(cands) / len(cands))
+            res.status_msg = _t("3-point perspective solved")
+            res.valid = True
+        elif dot_xy < -1.0:
+            f = math.sqrt(-dot_xy)
+            res.status_msg = _t("Lines converging properly")
+            res.valid = True
+        else:
+            f = (H / 2.0) / math.tan(math.radians(45.0) / 2.0)
+            res.status_msg = _t("Invalid vanishing point configuration")
     else:
-        f = math.sqrt(-dot_prod)
-        res.status_msg = _t("Lines converging properly")
-        res.valid = True
+        if dot_xy >= -1.0:
+            res.status_msg = _t("Invalid vanishing point configuration")
+            f = (H / 2.0) / math.tan(math.radians(45.0) / 2.0)
+        else:
+            f = math.sqrt(-dot_xy)
+            res.status_msg = _t("Lines converging properly")
+            res.valid = True
 
     f = max(50.0, min(100000.0, f))
     res.focal_px = f
@@ -526,7 +624,6 @@ def solve_perspective(
     fov_deg = math.degrees(2.0 * math.atan((H / 2.0) / f))
     fov_deg = max(5.0, min(140.0, fov_deg))
     res.fov_deg = fov_deg
-
     res.focal_35mm = 24.0 / (2.0 * math.tan(math.radians(fov_deg) / 2.0))
 
     rx = [du_x, dv_x, -f]
@@ -545,32 +642,57 @@ def solve_perspective(
     if data.invert_y:
         ry = [-c for c in ry]
 
-    vx = rx
-    vy = ry
+    if data.mode == "3point":
+        # Form Z ray from guides
+        if vp_z is not None:
+            du_z = vp_z[0] - cx
+            dv_z = -(vp_z[1] - cy)
+            rz = [du_z, dv_z, -f]
+        else:
+            # Parallel Z lines on screen
+            dx_z = ((p_z1_b[0] - p_z1_a[0]) + (p_z2_b[0] - p_z2_a[0])) * 0.5
+            dy_z = ((p_z1_b[1] - p_z1_a[1]) + (p_z2_b[1] - p_z2_a[1])) * 0.5
+            rz = [dx_z, -dy_z, 0.0]
 
-    dot_xy = vx[0] * vy[0] + vx[1] * vy[1] + vx[2] * vy[2]
-    vy = [vy[0] - dot_xy * vx[0], vy[1] - dot_xy * vx[1], vy[2] - dot_xy * vx[2]]
-    len_vy = math.hypot(*vy)
-    if len_vy > 1e-6:
-        vy = [c / len_vy for c in vy]
-
-    if data.mode == "3point" and vp_z is not None:
-        du_z = vp_z[0] - cx
-        dv_z = -(vp_z[1] - cy)
-        rz = [du_z, dv_z, -f]
         len_z = math.hypot(*rz)
-        vz = [c / len_z for c in rz]
-        if data.invert_z or dv_z < 0:
-            vz = [-c for c in vz]
-        dot_xz = vx[0] * vz[0] + vx[1] * vz[1] + vx[2] * vz[2]
-        dot_yz = vy[0] * vz[0] + vy[1] * vz[1] + vy[2] * vz[2]
-        vz = [vz[0] - dot_xz * vx[0] - dot_yz * vy[0],
-              vz[1] - dot_xz * vx[1] - dot_yz * vy[1],
-              vz[2] - dot_xz * vx[2] - dot_yz * vy[2]]
-        len_vz = math.hypot(*vz)
-        if len_vz > 1e-6:
-            vz = [c / len_vz for c in vz]
+        if len_z > 1e-6:
+            rz = [c / len_z for c in rz]
+        else:
+            rz = [0.0, 1.0, 0.0]
+
+        # In camera frame, +Y is UP. For world +Z pointing upwards in scene:
+        if rz[1] < 0:
+            rz = [-c for c in rz]
+        if data.invert_z:
+            rz = [-c for c in rz]
+
+        # Right-handed chirality test: (rx x ry) . rz > 0
+        nx = rx[1] * ry[2] - rx[2] * ry[1]
+        ny = rx[2] * ry[0] - rx[0] * ry[2]
+        nz = rx[0] * ry[1] - rx[1] * ry[0]
+        dot_n = nx * rz[0] + ny * rz[1] + nz * rz[2]
+        if dot_n < 0:
+            ry = [-c for c in ry]
+
+        # Solve nearest orthogonal rotation matrix via polar decomposition
+        M = [
+            [rx[0], ry[0], rz[0]],
+            [rx[1], ry[1], rz[1]],
+            [rx[2], ry[2], rz[2]]
+        ]
+        R = nearest_rotation_matrix(M)
+        vx = [R[0][0], R[1][0], R[2][0]]
+        vy = [R[0][1], R[1][1], R[2][1]]
+        vz = [R[0][2], R[1][2], R[2][2]]
     else:
+        # 2-point mode: verticals stay strictly vertical
+        vx = rx
+        dot_xy_cam = vx[0] * ry[0] + vx[1] * ry[1] + vx[2] * ry[2]
+        vy = [ry[0] - dot_xy_cam * vx[0], ry[1] - dot_xy_cam * vx[1], ry[2] - dot_xy_cam * vx[2]]
+        len_vy = math.hypot(*vy)
+        if len_vy > 1e-6:
+            vy = [c / len_vy for c in vy]
+
         vz = [
             vx[1] * vy[2] - vx[2] * vy[1],
             vx[2] * vy[0] - vx[0] * vy[2],
@@ -591,6 +713,7 @@ def solve_perspective(
     res.v_y_cam = vy
     res.v_z_cam = vz
 
+    # Forward direction in world coordinates: -Row 2 of R (where -Z_cam is forward)
     fwd_x = -vx[2]
     fwd_y = -vy[2]
     fwd_z = -vz[2]
@@ -600,6 +723,17 @@ def solve_perspective(
         fwd_y /= len_fwd
         fwd_z /= len_fwd
     res.forward = QVector3D(fwd_x, fwd_y, fwd_z)
+
+    # Up direction in world coordinates: Row 1 of R (where +Y_cam is up)
+    up_x = vx[1]
+    up_y = vy[1]
+    up_z = vz[1]
+    len_up = math.hypot(up_x, up_y, up_z)
+    if len_up > 1e-6:
+        up_x /= len_up
+        up_y /= len_up
+        up_z /= len_up
+    res.up_w = QVector3D(up_x, up_y, up_z)
 
     pitch_rad = math.asin(max(-1.0, min(1.0, -fwd_z)))
     yaw_rad = math.atan2(-fwd_y, -fwd_x)
@@ -1555,6 +1689,9 @@ class PerspectiveMatcherPlugin:
             cam = self.app.viewport.camera
             if "camera" in view_data:
                 apply_camera_state(cam, view_data["camera"])
+            else:
+                cam.up = QVector3D(0.0, 0.0, 1.0)
+                cam.two_point = False
 
         self.save_state()
         if self.panel is not None:
@@ -1669,8 +1806,13 @@ class PerspectiveMatcherPlugin:
                 cam = vp.camera
                 cam.fov_deg = self.solved.fov_deg
                 cam.distance = self.data.distance
+                if self.data.mode == "3point":
+                    cam.up = self.solved.up_w
+                    cam.two_point = False
+                else:
+                    cam.up = QVector3D(0.0, 0.0, 1.0)
+                    cam.two_point = True
                 cam.look_from(self.solved.eye, self.solved.forward)
-                cam.two_point = (self.data.mode == "2point")
             else:
                 cam = vp.camera
                 cam.distance *= factor
@@ -1846,8 +1988,13 @@ class PerspectiveMatcherPlugin:
         cam = vp.camera
         cam.fov_deg = self.solved.fov_deg
         cam.distance = self.data.distance
+        if self.data.mode == "3point":
+            cam.up = self.solved.up_w
+            cam.two_point = False
+        else:
+            cam.up = QVector3D(0.0, 0.0, 1.0)
+            cam.two_point = True
         cam.look_from(self.solved.eye, self.solved.forward)
-        cam.two_point = (self.data.mode == "2point")
         vp.update()
 
     def _draw_scene_tabs(self, viewport, painter: QPainter) -> None:
@@ -2201,45 +2348,32 @@ class PerspectiveMatcherPlugin:
         # True 3D Origin Perspective Axes Gizmo
         arm = 42.0
 
-        if self.solved.vp_x is not None:
-            vx, vy = self.solved.vp_x
-            if not (math.isnan(vx) or math.isnan(vy) or math.isinf(vx) or math.isinf(vy)):
-                dx = vx - p_orig.x()
-                dy = vy - p_orig.y()
-                l = math.hypot(dx, dy)
-                if l > 1e-4:
-                    sign = -1.0 if (self.data.invert_x ^ self.data.swap_xy) else 1.0
-                    painter.setPen(QPen(COLOR_X, 2.8))
-                    painter.drawLine(p_orig, QPointF(p_orig.x() + sign * arm * dx / l,
-                                                    p_orig.y() + sign * arm * dy / l))
+        # World X (Red)
+        dx_x = self.solved.v_x_cam[0]
+        dy_x = -self.solved.v_x_cam[1]
+        l_x = math.hypot(dx_x, dy_x)
+        if l_x > 1e-4:
+            painter.setPen(QPen(COLOR_X, 2.8))
+            painter.drawLine(p_orig, QPointF(p_orig.x() + arm * dx_x / l_x,
+                                            p_orig.y() + arm * dy_x / l_x))
 
-        if self.solved.vp_y is not None:
-            vx, vy = self.solved.vp_y
-            if not (math.isnan(vx) or math.isnan(vy) or math.isinf(vx) or math.isinf(vy)):
-                dx = vx - p_orig.x()
-                dy = vy - p_orig.y()
-                l = math.hypot(dx, dy)
-                if l > 1e-4:
-                    sign = -1.0 if (self.data.invert_y ^ self.data.swap_xy) else 1.0
-                    painter.setPen(QPen(COLOR_Y, 2.8))
-                    painter.drawLine(p_orig, QPointF(p_orig.x() + sign * arm * dx / l,
-                                                    p_orig.y() + sign * arm * dy / l))
+        # World Y (Green)
+        dx_y = self.solved.v_y_cam[0]
+        dy_y = -self.solved.v_y_cam[1]
+        l_y = math.hypot(dx_y, dy_y)
+        if l_y > 1e-4:
+            painter.setPen(QPen(COLOR_Y, 2.8))
+            painter.drawLine(p_orig, QPointF(p_orig.x() + arm * dx_y / l_y,
+                                            p_orig.y() + arm * dy_y / l_y))
 
-        if self.solved.vp_z is not None and self.data.mode == "3point":
-            vx, vy = self.solved.vp_z
-            if not (math.isnan(vx) or math.isnan(vy) or math.isinf(vx) or math.isinf(vy)):
-                dx = vx - p_orig.x()
-                dy = vy - p_orig.y()
-                l = math.hypot(dx, dy)
-                if l > 1e-4:
-                    sign = -1.0 if self.data.invert_z else 1.0
-                    painter.setPen(QPen(COLOR_Z, 2.8))
-                    painter.drawLine(p_orig, QPointF(p_orig.x() + sign * arm * dx / l,
-                                                    p_orig.y() + sign * arm * dy / l))
-        else:
+        # World Z (Blue)
+        dx_z = self.solved.v_z_cam[0]
+        dy_z = -self.solved.v_z_cam[1]
+        l_z = math.hypot(dx_z, dy_z)
+        if l_z > 1e-4:
             painter.setPen(QPen(COLOR_Z, 2.8))
-            sign = 1.0 if self.data.invert_z else -1.0
-            painter.drawLine(p_orig, QPointF(p_orig.x(), p_orig.y() + sign * arm))
+            painter.drawLine(p_orig, QPointF(p_orig.x() + arm * dx_z / l_z,
+                                            p_orig.y() + arm * dy_z / l_z))
 
         # Bottom SketchUp-Style Prompt and Guidance Bar
         guide_rect = QRectF(12, h - 36, w - 24, 26)
