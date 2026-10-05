@@ -11,6 +11,11 @@ Features:
     * [ 📷 Perspective Match ] (locks/matches photo camera)
     * [ 🌐 Default 3D ] (returns to free 3D orbit)
     * [ ➕ Add View ] (saves current viewport view)
+    * [ 📏 Calibrate Scale ] (sets real distance to edge to scale model while preserving match)
+- Real-World Scale Calibration:
+    * Select any edge in the 3D viewport and input its real physical dimension (e.g. 5.00 m).
+    * Scales 3D volume and camera distance proportionally around Origin (0, 0, 0).
+    * Optical projection rays are mathematically invariant: photo match remains 100% pixel-perfect!
 - Precision Loupe (magnifying zoom glass on handle drag with [Shift] 0.2x slow-motion micro-adjustment).
 - Overlay reference photograph with adjustable opacity.
 - Interactive vanishing lines:
@@ -34,11 +39,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt
 from PySide6.QtGui import (
-    QBrush, QColor, QCursor, QFont, QFontMetrics, QImage, QPainter, QPainterPath, QPen,
-    QPixmap, QVector3D
+    QBrush, QColor, QCursor, QFont, QFontMetrics, QImage, QMatrix4x4,
+    QPainter, QPainterPath, QPen, QPixmap, QVector3D
 )
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMessageBox, QPushButton, QSlider, QVBoxLayout, QWidget
 )
@@ -85,6 +90,19 @@ _TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "Enable Perspective Match": "Activar Ajuste de Perspectiva",
         "Perspective Match: ACTIVE": "Ajuste de Perspectiva: ACTIVO",
         "Perspective Match: OFF": "Ajuste de Perspectiva: INACTIVO",
+        "Real-World Scale Calibration": "Calibración de Escala Real",
+        "Select an edge in the viewport to match scale.": "Selecciona una arista en la vista para calibrar la escala.",
+        "Current Length (m):": "Longitud Actual (m):",
+        "Real Length (m):": "Longitud Real (m):",
+        "Current Length:": "Longitud Actual:",
+        "Real Length:": "Longitud Real:",
+        "Read Edge": "Leer Arista",
+        "Apply Scale": "Aplicar Escala",
+        "Cancel": "Cancelar",
+        "Detected:": "Detectado:",
+        "No edge selected in viewport. Select an edge, or enter Current Length manually.": (
+            "Ninguna arista seleccionada. Selecciona una arista o ingresa la longitud actual manualmente."
+        ),
     }
 }
 
@@ -176,6 +194,111 @@ def apply_camera_state(cam, state: Dict[str, Any]) -> None:
             cam.target = QVector3D(*state["target"])
         except Exception:
             pass
+
+
+# ---- Real-World Scale & Geometry Manipulation Helpers ----------------------
+def get_selected_edge_info(scene) -> Optional[Tuple[float, str]]:
+    """Inspects scene.selection and returns (current_length_in_meters, description)."""
+    if scene is None or not hasattr(scene, "selection") or not scene.selection:
+        return None
+
+    # 1. Direct Edge entities
+    edges = [e for e in scene.selection if hasattr(e, "a") and hasattr(e, "b")]
+    if edges:
+        e = edges[0]
+        p1 = QVector3D(e.a.x(), e.a.y(), e.a.z()) if hasattr(e.a, "x") else QVector3D(e.a)
+        p2 = QVector3D(e.b.x(), e.b.y(), e.b.z()) if hasattr(e.b, "x") else QVector3D(e.b)
+        dx = float(p2.x() - p1.x())
+        dy = float(p2.y() - p1.y())
+        dz = float(p2.z() - p1.z())
+        length = math.hypot(dx, dy, dz)
+        return (length, f"Edge ({length:.3f} m)")
+
+    # 2. Two selected vertices or guide points
+    pts = []
+    for ent in scene.selection:
+        if hasattr(ent, "position") and hasattr(ent.position, "x"):
+            pts.append(QVector3D(ent.position))
+        elif hasattr(ent, "point") and hasattr(ent.point, "x"):
+            pts.append(QVector3D(ent.point))
+        elif hasattr(ent, "x") and hasattr(ent, "y") and hasattr(ent, "z"):
+            pts.append(QVector3D(ent.x(), ent.y(), ent.z()))
+
+    if len(pts) == 2:
+        dx = float(pts[1].x() - pts[0].x())
+        dy = float(pts[1].y() - pts[0].y())
+        dz = float(pts[1].z() - pts[0].z())
+        length = math.hypot(dx, dy, dz)
+        return (length, f"2 Points ({length:.3f} m)")
+
+    return None
+
+
+def scale_scene_geometry(scene, factor: float) -> None:
+    """Scales all geometry in scene (loose mesh and groups) around origin (0, 0, 0)."""
+    if scene is None or abs(factor - 1.0) < 1e-7:
+        return
+
+    # Scale loose mesh vertices
+    if hasattr(scene, "mesh") and scene.mesh is not None:
+        mesh = scene.mesh
+        if hasattr(mesh, "vertices"):
+            for v in mesh.vertices:
+                if hasattr(v, "position"):
+                    pos = v.position
+                    if hasattr(pos, "x"):
+                        v.position = QVector3D(
+                            float(pos.x()) * factor,
+                            float(pos.y()) * factor,
+                            float(pos.z()) * factor
+                        )
+                elif hasattr(v, "x") and hasattr(v, "setX"):
+                    v.setX(float(v.x()) * factor)
+                    v.setY(float(v.y()) * factor)
+                    v.setZ(float(v.z()) * factor)
+
+    # Scale groups (groups/components)
+    if hasattr(scene, "groups") and scene.groups:
+        for g in scene.groups:
+            _scale_group_recursive(g, factor)
+
+    # Scale guide points if present
+    if hasattr(scene, "guides") and scene.guides:
+        for guide in scene.guides:
+            if hasattr(guide, "point") and hasattr(guide.point, "x"):
+                p = guide.point
+                guide.point = QVector3D(
+                    float(p.x()) * factor,
+                    float(p.y()) * factor,
+                    float(p.z()) * factor
+                )
+
+    if hasattr(scene, "version"):
+        scene.version += 1
+
+
+def _scale_group_recursive(group, factor: float) -> None:
+    """Recursively scales a Group around origin (0, 0, 0)."""
+    if hasattr(group, "xform") and group.xform is not None:
+        mat = QMatrix4x4()
+        mat.scale(factor, factor, factor)
+        group.xform = mat * group.xform
+    elif hasattr(group, "mesh") and group.mesh is not None:
+        mesh = group.mesh
+        if hasattr(mesh, "vertices"):
+            for v in mesh.vertices:
+                if hasattr(v, "position"):
+                    pos = v.position
+                    if hasattr(pos, "x"):
+                        v.position = QVector3D(
+                            float(pos.x()) * factor,
+                            float(pos.y()) * factor,
+                            float(pos.z()) * factor
+                        )
+
+    if hasattr(group, "children") and group.children:
+        for child in group.children:
+            _scale_group_recursive(child, factor)
 
 
 # ---- Mathematical Projective Geometry Solver -------------------------------
@@ -516,6 +639,7 @@ class PerspectiveEventFilter(QObject):
         self.hovered_handle: Optional[str] = None
         self.hovered_tab_index: Optional[int] = None
         self.hovered_add_btn: bool = False
+        self.hovered_scale_btn: bool = False
         self.hovered_toggle_btn: bool = False
         self.is_shift_held: bool = False
         self.last_mouse_pos: Optional[QPointF] = None
@@ -541,6 +665,7 @@ class PerspectiveEventFilter(QObject):
             pos = event.position()
             hit_tab = self._hit_test_tabs(pos.x(), pos.y())
             hit_add = (self.plugin.add_view_rect is not None and self.plugin.add_view_rect.contains(pos))
+            hit_scale = (self.plugin.scale_tool_rect is not None and self.plugin.scale_tool_rect.contains(pos))
             hit_toggle = (self.plugin.master_toggle_rect is not None and self.plugin.master_toggle_rect.contains(pos))
 
             changed = False
@@ -550,17 +675,23 @@ class PerspectiveEventFilter(QObject):
             if hit_add != self.hovered_add_btn:
                 self.hovered_add_btn = hit_add
                 changed = True
+            if hit_scale != self.hovered_scale_btn:
+                self.hovered_scale_btn = hit_scale
+                changed = True
             if hit_toggle != self.hovered_toggle_btn:
                 self.hovered_toggle_btn = hit_toggle
                 changed = True
 
-            if hit_tab is not None or hit_add or hit_toggle:
+            if hit_tab is not None or hit_add or hit_scale or hit_toggle:
                 vp.setCursor(Qt.PointingHandCursor)
                 if changed:
                     vp.update()
                 return False
             else:
-                if self.hovered_handle is None and (self.hovered_tab_index is not None or self.hovered_add_btn or self.hovered_toggle_btn):
+                if self.hovered_handle is None and (
+                    self.hovered_tab_index is not None or self.hovered_add_btn
+                    or self.hovered_scale_btn or self.hovered_toggle_btn
+                ):
                     vp.unsetCursor()
                 if changed:
                     vp.update()
@@ -584,6 +715,12 @@ class PerspectiveEventFilter(QObject):
             # Add view button click
             if self.plugin.add_view_rect is not None and self.plugin.add_view_rect.contains(pos):
                 self.plugin.add_current_view()
+                vp.update()
+                return True
+
+            # Calibrate scale button click [📏]
+            if self.plugin.scale_tool_rect is not None and self.plugin.scale_tool_rect.contains(pos):
+                self.plugin.open_scale_dialog()
                 vp.update()
                 return True
 
@@ -635,7 +772,10 @@ class PerspectiveEventFilter(QObject):
                 self.hovered_handle = hit
                 if hit is not None:
                     vp.setCursor(Qt.PointingHandCursor)
-                elif not (self.hovered_tab_index is not None or self.hovered_add_btn or self.hovered_toggle_btn):
+                elif not (
+                    self.hovered_tab_index is not None or self.hovered_add_btn
+                    or self.hovered_scale_btn or self.hovered_toggle_btn
+                ):
                     vp.unsetCursor()
                 vp.update()
 
@@ -677,7 +817,7 @@ class PerspectiveEventFilter(QObject):
 
 # ---- Side Tray UI Panel ---------------------------------------------------
 class PerspectiveMatcherPanel(QWidget):
-    """Side panel for controlling perspective match photo, guides, and parameters."""
+    """Side panel for controlling perspective match photo, guides, scenes, and scale."""
 
     def __init__(self, plugin: "PerspectiveMatcherPlugin") -> None:
         super().__init__()
@@ -718,6 +858,50 @@ class PerspectiveMatcherPanel(QWidget):
         scenes_lay.addLayout(views_btn_row)
 
         lay.addWidget(scenes_grp)
+
+        # --- Real-World Scale Calibration Section ---
+        scale_grp = QGroupBox(_t("Real-World Scale Calibration"))
+        scale_lay = QVBoxLayout(scale_grp)
+        scale_lay.setSpacing(6)
+
+        self.lbl_selected_edge = QLabel(_t("Select an edge in the viewport to match scale."))
+        self.lbl_selected_edge.setStyleSheet("color: #AAA; font-size: 11px;")
+        self.lbl_selected_edge.setWordWrap(True)
+        scale_lay.addWidget(self.lbl_selected_edge)
+
+        cur_row = QHBoxLayout()
+        cur_row.addWidget(QLabel(_t("Current Length (m):")))
+        self.spin_current_len = QDoubleSpinBox()
+        self.spin_current_len.setRange(0.001, 100000.0)
+        self.spin_current_len.setDecimals(3)
+        self.spin_current_len.setValue(1.0)
+        self.spin_current_len.setSuffix(" m")
+        cur_row.addWidget(self.spin_current_len)
+        scale_lay.addLayout(cur_row)
+
+        target_row = QHBoxLayout()
+        target_row.addWidget(QLabel(_t("Real Length (m):")))
+        self.spin_target_len = QDoubleSpinBox()
+        self.spin_target_len.setRange(0.001, 100000.0)
+        self.spin_target_len.setDecimals(3)
+        self.spin_target_len.setValue(5.0)
+        self.spin_target_len.setSuffix(" m")
+        target_row.addWidget(self.spin_target_len)
+        scale_lay.addLayout(target_row)
+
+        btn_scale_row = QHBoxLayout()
+        self.btn_measure_edge = QPushButton(_t("Read Edge"))
+        self.btn_measure_edge.clicked.connect(self._on_read_selected_edge)
+
+        self.btn_apply_scale = QPushButton(_t("Apply Scale"))
+        self.btn_apply_scale.setStyleSheet("background-color: #007ACC; color: white; font-weight: bold; padding: 5px;")
+        self.btn_apply_scale.clicked.connect(self._on_apply_scale)
+
+        btn_scale_row.addWidget(self.btn_measure_edge)
+        btn_scale_row.addWidget(self.btn_apply_scale)
+        scale_lay.addLayout(btn_scale_row)
+
+        lay.addWidget(scale_grp)
 
         # --- Photo Section ---
         photo_grp = QGroupBox(_t("Reference Photograph"))
@@ -773,7 +957,7 @@ class PerspectiveMatcherPanel(QWidget):
         dist_row = QHBoxLayout()
         dist_row.addWidget(QLabel(_t("Camera Distance (m):")))
         self.spin_dist = QDoubleSpinBox()
-        self.spin_dist.setRange(0.5, 5000.0)
+        self.spin_dist.setRange(0.5, 50000.0)
         self.spin_dist.setSingleStep(1.0)
         self.spin_dist.setValue(self.plugin.data.distance)
         self.spin_dist.valueChanged.connect(self._on_dist_changed)
@@ -874,6 +1058,16 @@ class PerspectiveMatcherPanel(QWidget):
             self.views_list.setCurrentRow(self.plugin.data.active_view_index)
         self.views_list.blockSignals(False)
 
+        # Check for currently selected edge in viewport
+        edge_info = self.plugin.get_selected_edge_info()
+        if edge_info is not None:
+            cur_len, desc = edge_info
+            self.lbl_selected_edge.setText(f"🟢 {_t('Detected:')} {desc}")
+            self.lbl_selected_edge.setStyleSheet("color: #4CAF50; font-size: 11px;")
+            self.spin_current_len.blockSignals(True)
+            self.spin_current_len.setValue(cur_len)
+            self.spin_current_len.blockSignals(False)
+
         self.lbl_path.setText(os.path.basename(self.plugin.data.image_path) or "")
 
         for w in (self.slider_opacity, self.chk_show_photo, self.chk_show_guides,
@@ -928,6 +1122,35 @@ class PerspectiveMatcherPanel(QWidget):
 
     def _on_rename_view(self) -> None:
         self.plugin.rename_view(self.plugin.data.active_view_index)
+
+    def _on_read_selected_edge(self) -> None:
+        info = self.plugin.get_selected_edge_info()
+        if info is not None:
+            length, desc = info
+            self.spin_current_len.setValue(length)
+            self.lbl_selected_edge.setText(f"🟢 {_t('Detected:')} {desc}")
+            self.lbl_selected_edge.setStyleSheet("color: #4CAF50; font-size: 11px;")
+        else:
+            self.lbl_selected_edge.setText(
+                _t("No edge selected in viewport. Select an edge, or enter Current Length manually.")
+            )
+            self.lbl_selected_edge.setStyleSheet("color: #FFA726; font-size: 11px;")
+
+    def _on_apply_scale(self) -> None:
+        cur_len = self.spin_current_len.value()
+        tgt_len = self.spin_target_len.value()
+        if cur_len <= 1e-6 or tgt_len <= 1e-6:
+            return
+
+        ok, msg = self.plugin.scale_model_to_edge(cur_len, tgt_len)
+        if ok:
+            self.lbl_selected_edge.setText(f"✅ {msg}")
+            self.lbl_selected_edge.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 11px;")
+            self.spin_current_len.setValue(tgt_len)
+            self.refresh_ui()
+        else:
+            self.lbl_selected_edge.setText(f"⚠️ {msg}")
+            self.lbl_selected_edge.setStyleSheet("color: #FF5252; font-size: 11px;")
 
     def _on_load_photo(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1019,6 +1242,7 @@ class PerspectiveMatcherPlugin:
         # Cache of hit rects for viewport drawing & event filter
         self.scene_tab_rects: List[Tuple[QRectF, int]] = []
         self.add_view_rect: Optional[QRectF] = None
+        self.scale_tool_rect: Optional[QRectF] = None
         self.master_toggle_rect: Optional[QRectF] = None
 
         # Load persisted document data
@@ -1028,6 +1252,7 @@ class PerspectiveMatcherPlugin:
             if self.data.image_path and os.path.isfile(self.data.image_path):
                 self.pixmap = QPixmap(self.data.image_path)
 
+        self.panel: Optional[PerspectiveMatcherPanel] = None
         self.panel = PerspectiveMatcherPanel(self)
         self.filter = PerspectiveEventFilter(self)
         app.viewport.installEventFilter(self.filter)
@@ -1065,7 +1290,8 @@ class PerspectiveMatcherPlugin:
                 self.switch_to_view(1)
 
         self.save_state()
-        self.panel.refresh_ui()
+        if self.panel is not None:
+            self.panel.refresh_ui()
         self.app.viewport.update()
 
     def switch_to_view(self, index: int) -> None:
@@ -1090,7 +1316,8 @@ class PerspectiveMatcherPlugin:
             self.app.viewport.update()
 
         self.save_state()
-        self.panel.refresh_ui()
+        if self.panel is not None:
+            self.panel.refresh_ui()
         self.app.viewport.update()
 
     def add_current_view(self) -> None:
@@ -1106,17 +1333,17 @@ class PerspectiveMatcherPlugin:
             "camera": cam_state
         })
         self.data.active_view_index = len(self.data.saved_views) - 1
-        self.data.enabled = False  # Custom scene is a normal orbit view
+        self.data.enabled = False
 
         self.save_state()
-        self.panel.refresh_ui()
+        if self.panel is not None:
+            self.panel.refresh_ui()
         self.app.viewport.update()
 
     def update_active_view_camera(self) -> None:
         """Overwrites the selected view with current viewport camera."""
         idx = self.data.active_view_index
         if idx <= 0:
-            # View 0 is dynamically solved from guides
             self.update_camera_from_guides()
             return
 
@@ -1129,7 +1356,7 @@ class PerspectiveMatcherPlugin:
     def delete_view(self, index: int) -> None:
         """Deletes a custom saved scene view (cannot delete default views)."""
         if index <= 1:
-            return  # Protect "Perspective Match" and "Default 3D"
+            return
 
         del self.data.saved_views[index]
         if self.data.active_view_index >= len(self.data.saved_views):
@@ -1148,8 +1375,108 @@ class PerspectiveMatcherPlugin:
         if ok and new_name.strip():
             self.data.saved_views[index]["name"] = new_name.strip()
             self.save_state()
-            self.panel.refresh_ui()
+            if self.panel is not None:
+                self.panel.refresh_ui()
             self.app.viewport.update()
+
+    def get_selected_edge_info(self) -> Optional[Tuple[float, str]]:
+        """Returns (length, description) for the active selection in viewport.scene."""
+        try:
+            scene = self.app.viewport.scene
+        except Exception:
+            return None
+        return get_selected_edge_info(scene)
+
+    def scale_model_to_edge(self, current_len: float, target_len: float) -> Tuple[bool, str]:
+        """Scales the 3D scene geometry and camera distance to match the real dimension.
+        Preserves camera optical rays so the photo perspective match is 100% untouched!"""
+        if current_len <= 1e-6 or target_len <= 1e-6:
+            return False, "Invalid distance values"
+
+        factor = target_len / current_len
+        if abs(factor - 1.0) < 1e-6:
+            return True, "Scale is already 1.0×"
+
+        vp = self.app.viewport
+        scene = getattr(vp, "scene", None)
+
+        def mutate(sc):
+            scale_scene_geometry(sc, factor)
+
+        executed = False
+        try:
+            from core.history import SnapshotImport
+            cmd = SnapshotImport(mutate)
+            vp.history.execute(cmd)
+            executed = True
+        except Exception:
+            pass
+
+        if not executed and scene is not None:
+            mutate(scene)
+
+        # Scale camera distance to perfectly preserve 2D projection
+        self.data.distance *= factor
+        self.update_camera_from_guides()
+        self.save_state()
+        vp.update()
+
+        msg = f"Scaled by {factor:.3f}×. Edge is now {target_len:.3f} m (Match preserved)"
+        return True, msg
+
+    def open_scale_dialog(self) -> None:
+        """Opens quick modal dialog to calibrate scene scale directly from viewport."""
+        info = self.get_selected_edge_info()
+        init_cur = info[0] if info else 1.0
+
+        parent_win = self.panel.window() if self.panel is not None else None
+        dlg = QDialog(parent_win)
+        dlg.setWindowTitle(_t("Real-World Scale Calibration"))
+        dlg.setFixedWidth(360)
+        lay = QVBoxLayout(dlg)
+        lay.setSpacing(10)
+
+        info_lbl = QLabel(
+            f"🟢 {_t('Detected:')} {info[1]}" if info else _t("⚪ Select an edge in viewport or enter below:")
+        )
+        info_lbl.setStyleSheet("font-size: 11px; color: #4CAF50;" if info else "font-size: 11px; color: #FFA726;")
+        info_lbl.setWordWrap(True)
+        lay.addWidget(info_lbl)
+
+        form = QFormLayout()
+        cur_spin = QDoubleSpinBox()
+        cur_spin.setRange(0.001, 100000.0)
+        cur_spin.setDecimals(3)
+        cur_spin.setValue(init_cur)
+        cur_spin.setSuffix(" m")
+        form.addRow(_t("Current Length:"), cur_spin)
+
+        tgt_spin = QDoubleSpinBox()
+        tgt_spin.setRange(0.001, 100000.0)
+        tgt_spin.setDecimals(3)
+        tgt_spin.setValue(round(init_cur, 1) if init_cur > 1.0 else 5.0)
+        tgt_spin.setSuffix(" m")
+        form.addRow(_t("Real Length:"), tgt_spin)
+        lay.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        apply_btn = QPushButton(_t("Apply Scale"))
+        apply_btn.setStyleSheet("background-color: #007ACC; color: white; font-weight: bold; padding: 6px;")
+        cancel_btn = QPushButton(_t("Cancel"))
+        btn_row.addWidget(apply_btn)
+        btn_row.addWidget(cancel_btn)
+        lay.addLayout(btn_row)
+
+        def on_apply():
+            ok, _msg = self.scale_model_to_edge(cur_spin.value(), tgt_spin.value())
+            if ok:
+                if self.panel is not None:
+                    self.panel.refresh_ui()
+                dlg.accept()
+
+        apply_btn.clicked.connect(on_apply)
+        cancel_btn.clicked.connect(dlg.reject)
+        dlg.exec()
 
     def update_camera_from_guides(self) -> None:
         """Solves perspective from current guides and sets IngeTrazo's OrbitCamera."""
@@ -1175,6 +1502,7 @@ class PerspectiveMatcherPlugin:
         w, h = viewport.width(), viewport.height()
         self.scene_tab_rects = []
         self.add_view_rect = None
+        self.scale_tool_rect = None
         self.master_toggle_rect = None
 
         painter.save()
@@ -1272,6 +1600,24 @@ class PerspectiveMatcherPlugin:
         painter.setPen(QPen(Qt.white))
         painter.drawText(add_rect, Qt.AlignCenter, "➕")
 
+        x += add_btn_w + 6.0
+
+        # 4. Calibrate Real Scale Button [📏]
+        scale_btn_w = 32.0
+        scale_rect = QRectF(x, y, scale_btn_w, tab_h)
+        self.scale_tool_rect = scale_rect
+
+        is_scale_hover = self.filter.hovered_scale_btn
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(0, 122, 204, 210) if is_scale_hover else QColor(30, 34, 44, 190)))
+        painter.drawRoundedRect(scale_rect, 4.0, 4.0)
+        painter.setPen(QPen(QColor(255, 255, 255, 60), 1.0))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(scale_rect, 4.0, 4.0)
+
+        painter.setPen(QPen(Qt.white))
+        painter.drawText(scale_rect, Qt.AlignCenter, "📏")
+
         painter.restore()
 
     def _draw_loupe(self, viewport, painter: QPainter, hx: float, hy: float, handle_name: str) -> None:
@@ -1279,7 +1625,6 @@ class PerspectiveMatcherPlugin:
         w, h = viewport.width(), viewport.height()
         radius = 75.0
 
-        # Optimal loupe center offset (+55, -95)
         lx = hx + 55.0
         ly = hy - 95.0
 
@@ -1298,7 +1643,7 @@ class PerspectiveMatcherPlugin:
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
 
-        # Draw leader line from handle to loupe
+        # Leader line from handle to loupe edge
         ldx = lx - hx
         ldy = ly - hy
         llen = math.hypot(ldx, ldy)
@@ -1318,12 +1663,10 @@ class PerspectiveMatcherPlugin:
         elif handle_name.startswith("z"):
             handle_color = QColor(0, 122, 255)
 
-        # Circular clip path
         clip = QPainterPath()
         clip.addEllipse(loupe_center, radius, radius)
         painter.setClipPath(clip)
 
-        # Dark background
         painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(QColor(18, 20, 26)))
         painter.drawRect(QRectF(lx - radius, ly - radius, radius * 2, radius * 2))
@@ -1575,7 +1918,7 @@ class PerspectiveMatcherPlugin:
         painter.setPen(QPen(QColor(255, 255, 255, 220)))
         painter.drawText(QPointF(p_orig.x() + 10, p_orig.y() + 14), "Origin (0,0,0)")
 
-        # Calibration HUD Badge at Bottom-Left (moved away from top tabs)
+        # Calibration HUD Badge at Bottom-Left
         badge_rect = QRectF(12, h - 38, 320, 26)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(QColor(20, 22, 28, 190)))
@@ -1585,12 +1928,15 @@ class PerspectiveMatcherPlugin:
         font.setBold(True)
         painter.setFont(font)
         painter.setPen(QPen(QColor(240, 240, 240)))
-        status_txt = f"🎯 f: {self.solved.focal_35mm:.1f}mm | FOV: {self.solved.fov_deg:.1f}° | P: {self.solved.pitch_deg:.1f}° | Y: {self.solved.yaw_deg:.1f}°"
+        status_txt = (
+            f"🎯 f: {self.solved.focal_35mm:.1f}mm | FOV: {self.solved.fov_deg:.1f}° | "
+            f"P: {self.solved.pitch_deg:.1f}° | Y: {self.solved.yaw_deg:.1f}°"
+        )
         painter.drawText(badge_rect.adjusted(8, 0, 0, 0), Qt.AlignVCenter | Qt.AlignLeft, status_txt)
 
         painter.restore()
 
-        # 5. DRAW PRECISION LOUPE IF A HANDLE IS ACTIVELY BEING DRAGGED
+        # 5. Draw precision loupe if a handle is actively being dragged
         if self.filter.active_handle is not None:
             rel = getattr(self.data, self.filter.active_handle, None)
             if rel is not None:
