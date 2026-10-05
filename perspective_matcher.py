@@ -1,46 +1,23 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Seghier Mohamed Abdellatif and IngeTrazo contributors.
-"""Perspective Matcher — Camera calibration and photo perspective matching for IngeTrazo.
-
-Aligns IngeTrazo's 3D viewport camera to an architectural photograph, identical
-in function to SketchUp's "Match New Photo" and Blender's "Perspective Plotter" / fSpy.
-
-Features:
-- Master Enable / Disable Toggle (always disabled by default, zero viewport interference).
-- SketchUp-style Scene Tabs on Viewport with clickable buttons:
-    * [ 📷 Perspective Match ] (locks/matches photo camera)
-    * [ 🌐 Default 3D ] (returns to free 3D orbit)
-    * [ ➕ Add View ] (saves current viewport view)
-    * [ 📏 Calibrate Scale ] (sets real distance to edge to scale model while preserving match)
-- Real-World Scale Calibration:
-    * Select any edge in the 3D viewport and input its real physical dimension (e.g. 5.00 m).
-    * Scales 3D volume and camera distance proportionally around Origin (0, 0, 0).
-    * Optical projection rays are mathematically invariant: photo match remains 100% pixel-perfect!
-- Precision Loupe (magnifying zoom glass on handle drag with [Shift] 0.2x slow-motion micro-adjustment).
-- Overlay reference photograph with adjustable opacity.
-- Interactive vanishing lines:
-    * 2 Red lines for the X axis -> Vanishing Point Vx.
-    * 2 Green lines for the Y axis -> Vanishing Point Vy.
-    * 2 Blue lines for the Z axis -> Vanishing Point Vz (in 3-point mode).
-- Draggable Origin pin (0, 0, 0) with true 3D perspective axes projection.
-- Horizon line visualization.
-- Real-time projective geometry solver:
-    * Solves camera focal length (mm, 35mm eq.) and Field of View (FOV).
-    * Computes 3D camera rotation matrix (Pitch, Yaw, Roll).
-    * Places camera eye such that (0, 0, 0) projects exactly onto the Origin handle.
-- 2-Point and 3-Point perspective modes.
-- Saves calibration and saved views configuration inside the IngeTrazo document (.igz).
+# Perspective Matcher Plugin for IngeTrazo
 """
+Perspective Matcher Extension for IngeTrazo (API v2).
+Calibrates camera focal length, FOV, rotation (yaw/pitch), and eye position
+from vanishing line guides aligned to a background photograph.
+Supports SketchUp / Blender style perspective matching, scene tabs,
+real-world scale calibration, and precision optical loupe.
+"""
+
 from __future__ import annotations
 
+import base64
 import math
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt
+from PySide6.QtCore import QByteArray, QBuffer, QEvent, QIODevice, QObject, QPointF, QRectF, Qt
 from PySide6.QtGui import (
-    QBrush, QColor, QCursor, QFont, QFontMetrics, QImage, QMatrix4x4,
-    QPainter, QPainterPath, QPen, QPixmap, QVector3D
+    QBrush, QColor, QFont, QMatrix4x4, QPainter, QPainterPath, QPen, QPixmap, QVector3D
 )
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
@@ -48,108 +25,36 @@ from PySide6.QtWidgets import (
     QListWidgetItem, QMessageBox, QPushButton, QSlider, QVBoxLayout, QWidget
 )
 
-from core.i18n import current_language
-
-
-# ---- Internationalization Helper -------------------------------------------
-_TRANSLATIONS: Dict[str, Dict[str, str]] = {
-    "es": {
-        "Perspective Match": "Ajuste de Perspectiva",
-        "Match Photo": "Ajustar Foto",
-        "Load Photograph…": "Cargar Fotografía…",
-        "Clear Photo": "Quitar Foto",
-        "Opacity:": "Opacidad:",
-        "Perspective Mode:": "Modo de Perspectiva:",
-        "2-Point (Verticals stay vertical)": "2 Puntos (Verticales rectas)",
-        "3-Point (Tilted camera)": "3 Puntos (Cámara inclinada)",
-        "Camera Distance (m):": "Distancia de Cámara (m):",
-        "Show Reference Guides": "Mostrar Guías de Referencia",
-        "Show Background Photo": "Mostrar Foto de Fondo",
-        "Lock Viewport Camera": "Bloquear Cámara de Vista",
-        "Align Camera Now": "Alinear Cámara Ahora",
-        "Reset Default Guides": "Restablecer Guías",
-        "Invert X Axis": "Invertir Eje X",
-        "Invert Y Axis": "Invertir Eje Y",
-        "Invert Z Axis": "Invertir Eje Z",
-        "Swap X ⇄ Y": "Intercambiar X ⇄ Y",
-        "Camera Calibration": "Calibración de Cámara",
-        "Focal Length:": "Distancia Focal:",
-        "Field of View (FOV):": "Campo de Visión (FOV):",
-        "Camera Pitch / Yaw:": "Inclinación / Giro:",
-        "Status:": "Estado:",
-        "Ready": "Listo",
-        "Lines converging properly": "Líneas convergiendo correctamente",
-        "Lines nearly parallel (adjust guides)": "Líneas casi paralelas (ajustar guías)",
-        "Invalid vanishing point configuration": "Configuración de puntos de fuga no válida",
-        "Saved Views & Scenes": "Vistas Guardadas y Escenas",
-        "Save Current": "Guardar Actual",
-        "Update Camera": "Actualizar Cámara",
-        "Delete": "Eliminar",
-        "Rename": "Renombrar",
-        "Default 3D": "3D Predeterminado",
-        "Enable Perspective Match": "Activar Ajuste de Perspectiva",
-        "Perspective Match: ACTIVE": "Ajuste de Perspectiva: ACTIVO",
-        "Perspective Match: OFF": "Ajuste de Perspectiva: INACTIVO",
-        "Real-World Scale Calibration": "Calibración de Escala Real",
-        "Select an edge in the viewport to match scale.": "Selecciona una arista en la vista para calibrar la escala.",
-        "Current Length (m):": "Longitud Actual (m):",
-        "Real Length (m):": "Longitud Real (m):",
-        "Current Length:": "Longitud Actual:",
-        "Real Length:": "Longitud Real:",
-        "Read Edge": "Leer Arista",
-        "Apply Scale": "Aplicar Escala",
-        "Cancel": "Cancelar",
-        "Detected:": "Detectado:",
-        "No edge selected in viewport. Select an edge, or enter Current Length manually.": (
-            "Ninguna arista seleccionada. Selecciona una arista o ingresa la longitud actual manualmente."
-        ),
-    }
-}
-
 
 def _t(text: str) -> str:
-    lang = current_language()
-    return _TRANSLATIONS.get(lang, {}).get(text, text)
+    """Translation stub for gettext / Qt tr."""
+    return text
 
 
-# ---- Camera State Capture & Restore Helpers --------------------------------
+# ---- Camera State Helpers --------------------------------------------------
 def get_camera_state(cam) -> Dict[str, Any]:
-    """Captures camera attributes (eye, forward, distance, fov) for view restoration."""
+    """Extracts IngeTrazo's OrbitCamera state into a JSON-safe dictionary.
+    Directly reads numerical attributes to avoid method-introspection bugs.
+    """
     state: Dict[str, Any] = {}
-    if hasattr(cam, "fov_deg"):
-        try:
-            state["fov_deg"] = float(cam.fov_deg)
-        except Exception:
-            pass
-    if hasattr(cam, "distance"):
-        try:
-            state["distance"] = float(cam.distance)
-        except Exception:
-            pass
-    if hasattr(cam, "two_point"):
-        try:
-            state["two_point"] = bool(cam.two_point)
-        except Exception:
-            pass
-    if hasattr(cam, "pitch"):
-        try:
-            state["pitch"] = float(cam.pitch)
-        except Exception:
-            pass
-    if hasattr(cam, "yaw"):
-        try:
-            state["yaw"] = float(cam.yaw)
-        except Exception:
-            pass
-    if hasattr(cam, "eye"):
-        v = cam.eye
-        state["eye"] = [float(v.x()), float(v.y()), float(v.z())] if hasattr(v, "x") else list(v)
-    if hasattr(cam, "forward"):
-        v = cam.forward
-        state["forward"] = [float(v.x()), float(v.y()), float(v.z())] if hasattr(v, "x") else list(v)
     if hasattr(cam, "target"):
-        v = cam.target
-        state["target"] = [float(v.x()), float(v.y()), float(v.z())] if hasattr(v, "x") else list(v)
+        t = cam.target
+        if hasattr(t, "x"):
+            state["target"] = [float(t.x()), float(t.y()), float(t.z())]
+        elif isinstance(t, (list, tuple)) and len(t) == 3:
+            state["target"] = [float(t[0]), float(t[1]), float(t[2])]
+    if hasattr(cam, "distance"):
+        state["distance"] = float(cam.distance)
+    if hasattr(cam, "yaw"):
+        state["yaw"] = float(cam.yaw)
+    if hasattr(cam, "pitch"):
+        state["pitch"] = float(cam.pitch)
+    if hasattr(cam, "fov_deg"):
+        state["fov_deg"] = float(cam.fov_deg)
+    if hasattr(cam, "two_point"):
+        state["two_point"] = bool(cam.two_point)
+    if hasattr(cam, "perspective"):
+        state["perspective"] = bool(cam.perspective)
     return state
 
 
@@ -157,43 +62,21 @@ def apply_camera_state(cam, state: Dict[str, Any]) -> None:
     """Restores camera attributes to IngeTrazo's OrbitCamera."""
     if not isinstance(state, dict):
         return
-    if "fov_deg" in state and hasattr(cam, "fov_deg"):
-        cam.fov_deg = float(state["fov_deg"])
-    if "distance" in state and hasattr(cam, "distance"):
+    if "target" in state:
+        t = state["target"]
+        cam.target = QVector3D(float(t[0]), float(t[1]), float(t[2]))
+    if "distance" in state:
         cam.distance = float(state["distance"])
-    if "two_point" in state and hasattr(cam, "two_point"):
+    if "yaw" in state:
+        cam.yaw = float(state["yaw"])
+    if "pitch" in state:
+        cam.pitch = float(state["pitch"])
+    if "fov_deg" in state:
+        cam.fov_deg = float(state["fov_deg"])
+    if "two_point" in state:
         cam.two_point = bool(state["two_point"])
-    if "pitch" in state and hasattr(cam, "pitch"):
-        try:
-            cam.pitch = float(state["pitch"])
-        except Exception:
-            pass
-    if "yaw" in state and hasattr(cam, "yaw"):
-        try:
-            cam.yaw = float(state["yaw"])
-        except Exception:
-            pass
-
-    # Prefer look_from with eye and forward
-    if "eye" in state and "forward" in state and hasattr(cam, "look_from"):
-        try:
-            eye = QVector3D(*state["eye"])
-            fwd = QVector3D(*state["forward"])
-            cam.look_from(eye, fwd)
-            return
-        except Exception:
-            pass
-
-    if "eye" in state and hasattr(cam, "eye"):
-        try:
-            cam.eye = QVector3D(*state["eye"])
-        except Exception:
-            pass
-    if "target" in state and hasattr(cam, "target"):
-        try:
-            cam.target = QVector3D(*state["target"])
-        except Exception:
-            pass
+    if "perspective" in state:
+        cam.perspective = bool(state["perspective"])
 
 
 # ---- Real-World Scale & Geometry Manipulation Helpers ----------------------
@@ -330,6 +213,7 @@ class PerspectiveMatchData:
         self.enabled: bool = False
 
         self.image_path: str = ""
+        self.image_b64: str = ""
         self.image_opacity: float = 0.55
         self.show_image: bool = True
         self.show_guides: bool = True
@@ -360,32 +244,38 @@ class PerspectiveMatchData:
         self.origin = [0.50, 0.72]
 
         # Saved Views / Scenes System
-        self.active_view_index: int = 1  # Start on Default 3D since match is disabled by default
+        # View 0: Perspective Match (photo alignment)
+        # View 1: Perspective (free 3D orbit)
+        self.active_view_index: int = 0
         self.saved_views: List[Dict[str, Any]] = [
             {
                 "name": "Perspective Match",
                 "type": "match",
             },
             {
-                "name": "Default 3D",
+                "name": "Perspective",
                 "type": "orbit",
                 "camera": {
-                    "fov_deg": 45.0,
-                    "distance": 35.0,
-                    "two_point": False,
-                    "eye": [28.0, 28.0, 20.0],
-                    "forward": [-0.65, -0.65, -0.4],
                     "target": [0.0, 0.0, 0.0],
+                    "distance": 35.0,
+                    "yaw": -0.785398,
+                    "pitch": 0.523598,
+                    "fov_deg": 45.0,
+                    "two_point": False,
+                    "perspective": True,
                 }
             }
         ]
 
     def to_dict(self) -> Dict[str, Any]:
+        """Serializes all match settings, guides, views, and photo backup."""
         return {
+            "has_perspective_match": True,
             "enabled": self.enabled,
             "active_view_index": self.active_view_index,
             "saved_views": list(self.saved_views),
             "image_path": self.image_path,
+            "image_b64": self.image_b64,
             "image_opacity": self.image_opacity,
             "show_image": self.show_image,
             "show_guides": self.show_guides,
@@ -412,12 +302,15 @@ class PerspectiveMatchData:
         }
 
     def from_dict(self, d: Dict[str, Any]) -> None:
+        """Restores persisted configuration without resetting guides or photo."""
         if not isinstance(d, dict):
             return
-        # ALWAYS disabled by default when loading documents
+
+        # Keep master toggle disabled by default on file load per requirement
         self.enabled = False
 
         self.image_path = str(d.get("image_path", self.image_path))
+        self.image_b64 = str(d.get("image_b64", self.image_b64))
         self.image_opacity = float(d.get("image_opacity", self.image_opacity))
         self.show_image = bool(d.get("show_image", self.show_image))
         self.show_guides = bool(d.get("show_guides", self.show_guides))
@@ -437,7 +330,7 @@ class PerspectiveMatchData:
         raw_views = d.get("saved_views", None)
         if isinstance(raw_views, list) and len(raw_views) >= 2:
             self.saved_views = raw_views
-            self.active_view_index = min(len(self.saved_views) - 1, int(d.get("active_view_index", 1)))
+            self.active_view_index = min(len(self.saved_views) - 1, int(d.get("active_view_index", 0)))
 
 
 class SolvedCameraParams:
@@ -640,7 +533,6 @@ class PerspectiveEventFilter(QObject):
         self.hovered_tab_index: Optional[int] = None
         self.hovered_add_btn: bool = False
         self.hovered_scale_btn: bool = False
-        self.hovered_toggle_btn: bool = False
         self.is_shift_held: bool = False
         self.last_mouse_pos: Optional[QPointF] = None
 
@@ -648,25 +540,28 @@ class PerspectiveEventFilter(QObject):
         t = event.type()
         vp = self.plugin.app.viewport
 
-        # Track Shift key for precision dragging and loupe display
+        # 1. Track Shift key for precision dragging and loupe display
         if t == QEvent.KeyPress:
             if event.key() == Qt.Key_Shift:
                 self.is_shift_held = True
-                if self.active_handle is not None:
+                if self.plugin.data.enabled:
                     vp.update()
         elif t == QEvent.KeyRelease:
             if event.key() == Qt.Key_Shift:
                 self.is_shift_held = False
-                if self.active_handle is not None:
+                if self.plugin.data.enabled:
                     vp.update()
 
-        # 1. Top tabs bar / master toggle interactions (ALWAYS ACTIVE)
+        # If perspective match is disabled, leave viewport interactions 100% untouched
+        if not self.plugin.data.enabled:
+            return False
+
+        # 2. Top Scene Tabs Bar Interactions (When Match is Enabled)
         if t == QEvent.MouseMove and not (event.buttons() & Qt.LeftButton):
             pos = event.position()
             hit_tab = self._hit_test_tabs(pos.x(), pos.y())
             hit_add = (self.plugin.add_view_rect is not None and self.plugin.add_view_rect.contains(pos))
             hit_scale = (self.plugin.scale_tool_rect is not None and self.plugin.scale_tool_rect.contains(pos))
-            hit_toggle = (self.plugin.master_toggle_rect is not None and self.plugin.master_toggle_rect.contains(pos))
 
             changed = False
             if hit_tab != self.hovered_tab_index:
@@ -678,19 +573,15 @@ class PerspectiveEventFilter(QObject):
             if hit_scale != self.hovered_scale_btn:
                 self.hovered_scale_btn = hit_scale
                 changed = True
-            if hit_toggle != self.hovered_toggle_btn:
-                self.hovered_toggle_btn = hit_toggle
-                changed = True
 
-            if hit_tab is not None or hit_add or hit_scale or hit_toggle:
+            if hit_tab is not None or hit_add or hit_scale:
                 vp.setCursor(Qt.PointingHandCursor)
                 if changed:
                     vp.update()
                 return False
             else:
                 if self.hovered_handle is None and (
-                    self.hovered_tab_index is not None or self.hovered_add_btn
-                    or self.hovered_scale_btn or self.hovered_toggle_btn
+                    self.hovered_tab_index is not None or self.hovered_add_btn or self.hovered_scale_btn
                 ):
                     vp.unsetCursor()
                 if changed:
@@ -699,12 +590,6 @@ class PerspectiveEventFilter(QObject):
         elif t == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
             pos = event.position()
 
-            # Master toggle button click
-            if self.plugin.master_toggle_rect is not None and self.plugin.master_toggle_rect.contains(pos):
-                self.plugin.toggle_enabled()
-                vp.update()
-                return True
-
             # Scene tabs click
             tab_idx = self._hit_test_tabs(pos.x(), pos.y())
             if tab_idx is not None:
@@ -712,7 +597,7 @@ class PerspectiveEventFilter(QObject):
                 vp.update()
                 return True
 
-            # Add view button click
+            # Add view button click [+]
             if self.plugin.add_view_rect is not None and self.plugin.add_view_rect.contains(pos):
                 self.plugin.add_current_view()
                 vp.update()
@@ -724,8 +609,23 @@ class PerspectiveEventFilter(QObject):
                 vp.update()
                 return True
 
-        # 2. Guide Handles Dragging (ONLY ACTIVE WHEN MATCH IS ENABLED AND CAMERA UNLOCKED)
-        if not self.plugin.data.enabled or not self.plugin.data.show_guides or self.plugin.data.camera_locked:
+        # 3. Handle 3D Orbit Camera Tracking (when in Perspective / Orbit tabs)
+        is_match_tab = (
+            self.plugin.data.active_view_index < len(self.plugin.data.saved_views)
+            and self.plugin.data.saved_views[self.plugin.data.active_view_index].get("type") == "match"
+        )
+
+        if not is_match_tab:
+            # User is orbiting in standard 3D perspective view
+            if t == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                curr_idx = self.plugin.data.active_view_index
+                if 0 <= curr_idx < len(self.plugin.data.saved_views):
+                    self.plugin.data.saved_views[curr_idx]["camera"] = get_camera_state(vp.camera)
+                    self.plugin.save_state()
+            return False
+
+        # 4. Guide Handles Dragging (ONLY when in Perspective Match tab)
+        if not self.plugin.data.show_guides or self.plugin.data.camera_locked:
             return False
 
         if t == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
@@ -747,7 +647,7 @@ class PerspectiveEventFilter(QObject):
                 self.is_shift_held = bool(event.modifiers() & Qt.ShiftModifier)
 
                 if self.is_shift_held and self.last_mouse_pos is not None:
-                    # Precision slow-motion mode (0.2x speed delta)
+                    # Precision slow-motion mode (0.2x delta)
                     dx = pos.x() - self.last_mouse_pos.x()
                     dy = pos.y() - self.last_mouse_pos.y()
                     cur = getattr(self.plugin.data, self.active_handle)
@@ -772,10 +672,7 @@ class PerspectiveEventFilter(QObject):
                 self.hovered_handle = hit
                 if hit is not None:
                     vp.setCursor(Qt.PointingHandCursor)
-                elif not (
-                    self.hovered_tab_index is not None or self.hovered_add_btn
-                    or self.hovered_scale_btn or self.hovered_toggle_btn
-                ):
+                elif not (self.hovered_tab_index is not None or self.hovered_add_btn or self.hovered_scale_btn):
                     vp.unsetCursor()
                 vp.update()
 
@@ -829,11 +726,15 @@ class PerspectiveMatcherPanel(QWidget):
         lay.setContentsMargins(6, 6, 6, 6)
         lay.setSpacing(8)
 
-        # --- Master Enable / Disable Toggle ---
-        self.btn_master_toggle = QPushButton()
-        self.btn_master_toggle.setCheckable(False)
-        self.btn_master_toggle.clicked.connect(self._on_master_toggle_clicked)
-        lay.addWidget(self.btn_master_toggle)
+        # --- Master Enable / Disable Toggle Checkbox ---
+        self.chk_match_enabled = QCheckBox(_t("Enable Perspective Match"))
+        self.chk_match_enabled.setStyleSheet(
+            "QCheckBox { font-size: 13px; font-weight: bold; padding: 6px; } "
+            "QCheckBox::indicator { width: 18px; height: 18px; }"
+        )
+        self.chk_match_enabled.setChecked(self.plugin.data.enabled)
+        self.chk_match_enabled.toggled.connect(self._on_master_toggle_toggled)
+        lay.addWidget(self.chk_match_enabled)
 
         # --- Saved Views & Scenes Section ---
         scenes_grp = QGroupBox(_t("Saved Views & Scenes"))
@@ -903,7 +804,7 @@ class PerspectiveMatcherPanel(QWidget):
 
         lay.addWidget(scale_grp)
 
-        # --- Photo Section ---
+        # --- Reference Photograph Section ---
         photo_grp = QGroupBox(_t("Reference Photograph"))
         photo_lay = QVBoxLayout(photo_grp)
         photo_lay.setSpacing(6)
@@ -1031,21 +932,22 @@ class PerspectiveMatcherPanel(QWidget):
         self.refresh_ui()
 
     def refresh_ui(self) -> None:
-        # Refresh Master Toggle visual state
+        # 1. Refresh Master Checkbox
+        self.chk_match_enabled.blockSignals(True)
+        self.chk_match_enabled.setChecked(self.plugin.data.enabled)
         if self.plugin.data.enabled:
-            self.btn_master_toggle.setText(_t("🟢 Perspective Match: ACTIVE"))
-            self.btn_master_toggle.setStyleSheet(
-                "background-color: #1B5E20; color: #FFFFFF; font-weight: bold; "
-                "font-size: 12px; padding: 7px; border: 1px solid #4CAF50; border-radius: 4px;"
+            self.chk_match_enabled.setStyleSheet(
+                "QCheckBox { font-size: 13px; font-weight: bold; color: #4CAF50; padding: 6px; } "
+                "QCheckBox::indicator { width: 18px; height: 18px; }"
             )
         else:
-            self.btn_master_toggle.setText(_t("⚪ Perspective Match: OFF (Click to Enable)"))
-            self.btn_master_toggle.setStyleSheet(
-                "background-color: #263238; color: #CFD8DC; font-weight: bold; "
-                "font-size: 12px; padding: 7px; border: 1px solid #546E7A; border-radius: 4px;"
+            self.chk_match_enabled.setStyleSheet(
+                "QCheckBox { font-size: 13px; font-weight: bold; color: #B0BEC5; padding: 6px; } "
+                "QCheckBox::indicator { width: 18px; height: 18px; }"
             )
+        self.chk_match_enabled.blockSignals(False)
 
-        # Refresh Views List
+        # 2. Refresh Views List
         self.views_list.blockSignals(True)
         self.views_list.clear()
         for idx, view in enumerate(self.plugin.data.saved_views):
@@ -1058,7 +960,7 @@ class PerspectiveMatcherPanel(QWidget):
             self.views_list.setCurrentRow(self.plugin.data.active_view_index)
         self.views_list.blockSignals(False)
 
-        # Check for currently selected edge in viewport
+        # 3. Check for selected edge in viewport
         edge_info = self.plugin.get_selected_edge_info()
         if edge_info is not None:
             cur_len, desc = edge_info
@@ -1104,8 +1006,8 @@ class PerspectiveMatcherPanel(QWidget):
         else:
             self.lbl_status.setStyleSheet("color: #FF9800; font-weight: bold;")
 
-    def _on_master_toggle_clicked(self) -> None:
-        self.plugin.toggle_enabled()
+    def _on_master_toggle_toggled(self, checked: bool) -> None:
+        self.plugin.toggle_enabled(checked)
 
     def _on_view_selected(self, row: int) -> None:
         if row >= 0 and row != self.plugin.data.active_view_index:
@@ -1218,6 +1120,7 @@ class PerspectiveMatcherPanel(QWidget):
     def _on_reset_guides(self) -> None:
         d = PerspectiveMatchData()
         d.image_path = self.plugin.data.image_path
+        d.image_b64 = self.plugin.data.image_b64
         d.image_opacity = self.plugin.data.image_opacity
         d.show_image = self.plugin.data.show_image
         d.saved_views = self.plugin.data.saved_views
@@ -1243,38 +1146,91 @@ class PerspectiveMatcherPlugin:
         self.scene_tab_rects: List[Tuple[QRectF, int]] = []
         self.add_view_rect: Optional[QRectF] = None
         self.scale_tool_rect: Optional[QRectF] = None
-        self.master_toggle_rect: Optional[QRectF] = None
 
         # Load persisted document data
-        saved = app.document_data(default=None)
-        if saved:
-            self.data.from_dict(saved)
-            if self.data.image_path and os.path.isfile(self.data.image_path):
-                self.pixmap = QPixmap(self.data.image_path)
+        self.load_state_from_document()
 
         self.panel: Optional[PerspectiveMatcherPanel] = None
         self.panel = PerspectiveMatcherPanel(self)
         self.filter = PerspectiveEventFilter(self)
         app.viewport.installEventFilter(self.filter)
 
+    def load_state_from_document(self) -> None:
+        """Loads perspective match configuration and restores photo without resetting existing state."""
+        saved = self.app.document_data(default=None)
+        if not saved:
+            try:
+                pdata = getattr(self.app.scene, "plugin_data", {}) or {}
+                saved = pdata.get(self.app.key, None)
+            except Exception:
+                saved = None
+
+        if saved and isinstance(saved, dict):
+            self.data.from_dict(saved)
+            self._restore_photo()
+
+    def _restore_photo(self) -> None:
+        """Restores QPixmap from file path or embedded base64."""
+        if self.data.image_path and os.path.isfile(self.data.image_path):
+            self.pixmap = QPixmap(self.data.image_path)
+        elif self.data.image_b64:
+            try:
+                ba = QByteArray.fromBase64(self.data.image_b64.encode("ascii"))
+                pm = QPixmap()
+                pm.loadFromData(ba)
+                self.pixmap = pm if not pm.isNull() else None
+            except Exception:
+                self.pixmap = None
+        else:
+            self.pixmap = None
+
+    def on_document_changed(self) -> None:
+        """Callback invoked whenever an existing document is opened or updated."""
+        self.load_state_from_document()
+        if self.panel is not None:
+            self.panel.refresh_ui()
+        self.app.viewport.update()
+
     def load_image(self, path: str) -> None:
+        """Loads image from disk and creates base64 backup for portability."""
         if os.path.isfile(path):
             self.data.image_path = path
             self.pixmap = QPixmap(path)
+            try:
+                with open(path, "rb") as f:
+                    raw = f.read()
+                    if len(raw) < 16 * 1024 * 1024:
+                        self.data.image_b64 = base64.b64encode(raw).decode("ascii")
+            except Exception:
+                pass
+
+            # Automatically enable match view when loading a new photo
+            self.data.enabled = True
+            self.data.active_view_index = 0
+            self.update_camera_from_guides()
             self.save_state()
             self.app.viewport.update()
 
     def clear_image(self) -> None:
         self.data.image_path = ""
+        self.data.image_b64 = ""
         self.pixmap = None
         self.save_state()
         self.app.viewport.update()
 
     def save_state(self) -> None:
-        self.app.set_document_data(self.data.to_dict())
+        """Serializes plugin data into document undo history and direct plugin_data."""
+        payload = self.data.to_dict()
+        self.app.set_document_data(payload)
+        try:
+            if not hasattr(self.app.scene, "plugin_data") or self.app.scene.plugin_data is None:
+                self.app.scene.plugin_data = {}
+            self.app.scene.plugin_data[self.app.key] = payload
+        except Exception:
+            pass
 
     def toggle_enabled(self, state: Optional[bool] = None) -> None:
-        """Toggles the master perspective match mode on or off."""
+        """Toggles perspective match mode on or off."""
         if state is None:
             self.data.enabled = not self.data.enabled
         else:
@@ -1285,7 +1241,7 @@ class PerspectiveMatcherPlugin:
             self.data.active_view_index = 0
             self.update_camera_from_guides()
         else:
-            # Revert to standard orbit view if coming from match view
+            # Revert to standard 3D orbit view
             if self.data.active_view_index == 0 and len(self.data.saved_views) > 1:
                 self.switch_to_view(1)
 
@@ -1295,25 +1251,29 @@ class PerspectiveMatcherPlugin:
         self.app.viewport.update()
 
     def switch_to_view(self, index: int) -> None:
-        """Switches active camera to a saved view / scene."""
+        """Switches active camera to a saved scene tab."""
         if index < 0 or index >= len(self.data.saved_views):
             return
 
+        # 1. Before leaving current view, save its 3D camera if not in match tab
+        curr_idx = self.data.active_view_index
+        if 0 <= curr_idx < len(self.data.saved_views):
+            if self.data.saved_views[curr_idx].get("type") != "match":
+                self.data.saved_views[curr_idx]["camera"] = get_camera_state(self.app.viewport.camera)
+
+        # 2. Switch to target view
         self.data.active_view_index = index
         view_data = self.data.saved_views[index]
         vtype = view_data.get("type", "custom")
 
         if vtype == "match":
-            # Enable match mode and align camera to photo
-            self.data.enabled = True
+            # Match view: align camera from vanishing guides & display photo
             self.update_camera_from_guides()
         else:
-            # Standard or custom 3D orbit view: disable match guides/photo
-            self.data.enabled = False
+            # 3D orbit view: restore exact last saved camera (yaw, pitch, distance, target)
             cam = self.app.viewport.camera
             if "camera" in view_data:
                 apply_camera_state(cam, view_data["camera"])
-            self.app.viewport.update()
 
         self.save_state()
         if self.panel is not None:
@@ -1332,29 +1292,21 @@ class PerspectiveMatcherPlugin:
             "type": "custom",
             "camera": cam_state
         })
-        self.data.active_view_index = len(self.data.saved_views) - 1
-        self.data.enabled = False
-
-        self.save_state()
-        if self.panel is not None:
-            self.panel.refresh_ui()
-        self.app.viewport.update()
+        self.switch_to_view(len(self.data.saved_views) - 1)
 
     def update_active_view_camera(self) -> None:
         """Overwrites the selected view with current viewport camera."""
         idx = self.data.active_view_index
-        if idx <= 0:
+        if idx == 0:
             self.update_camera_from_guides()
-            return
-
-        cam = self.app.viewport.camera
-        cam_state = get_camera_state(cam)
-        self.data.saved_views[idx]["camera"] = cam_state
-        self.save_state()
-        self.app.viewport.update()
+        else:
+            cam = self.app.viewport.camera
+            self.data.saved_views[idx]["camera"] = get_camera_state(cam)
+            self.save_state()
+            self.app.viewport.update()
 
     def delete_view(self, index: int) -> None:
-        """Deletes a custom saved scene view (cannot delete default views)."""
+        """Deletes a custom saved scene view (cannot delete default match or perspective)."""
         if index <= 1:
             return
 
@@ -1370,7 +1322,7 @@ class PerspectiveMatcherPlugin:
             return
         curr_name = self.data.saved_views[index].get("name", "")
         new_name, ok = QInputDialog.getText(
-            self.panel, _t("Rename"), _t("Name:"), QLineEdit.Normal, curr_name
+            self.panel, _t("Rename Scene"), _t("Name:"), QLineEdit.Normal, curr_name
         )
         if ok and new_name.strip():
             self.data.saved_views[index]["name"] = new_name.strip()
@@ -1490,6 +1442,13 @@ class PerspectiveMatcherPlugin:
             vp.update()
             return
 
+        is_match_tab = (
+            self.data.active_view_index < len(self.data.saved_views)
+            and self.data.saved_views[self.data.active_view_index].get("type") == "match"
+        )
+        if not is_match_tab:
+            return
+
         cam = vp.camera
         cam.fov_deg = self.solved.fov_deg
         cam.distance = self.data.distance
@@ -1498,12 +1457,11 @@ class PerspectiveMatcherPlugin:
         vp.update()
 
     def _draw_scene_tabs(self, viewport, painter: QPainter) -> None:
-        """Draws SketchUp-style Scene Tabs Bar and Master Toggle at the top of the viewport."""
+        """Draws SketchUp-style Scene Tabs Bar at the top of the viewport when enabled."""
         w, h = viewport.width(), viewport.height()
         self.scene_tab_rects = []
         self.add_view_rect = None
         self.scale_tool_rect = None
-        self.master_toggle_rect = None
 
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -1517,38 +1475,7 @@ class PerspectiveMatcherPlugin:
         y = 10.0
         tab_h = 28.0
 
-        # 1. Master Toggle Pill Button
-        toggle_text = "🟢 PERSPECTIVE MATCH: ON" if self.data.enabled else "⚪ PERSPECTIVE MATCH: OFF"
-        tw = fm.horizontalAdvance(toggle_text) + 24.0
-        t_rect = QRectF(x, y, tw, tab_h)
-        self.master_toggle_rect = t_rect
-
-        is_toggle_hover = self.filter.hovered_toggle_btn
-        painter.setPen(Qt.NoPen)
-        if self.data.enabled:
-            bg_col = QColor(24, 134, 75, 230) if not is_toggle_hover else QColor(30, 160, 90, 245)
-            border_col = QColor(100, 255, 160, 180)
-        else:
-            bg_col = QColor(36, 40, 50, 200) if not is_toggle_hover else QColor(48, 54, 68, 230)
-            border_col = QColor(120, 130, 150, 120)
-
-        painter.setBrush(QBrush(bg_col))
-        painter.drawRoundedRect(t_rect, 14.0, 14.0)
-        painter.setPen(QPen(border_col, 1.2))
-        painter.setBrush(Qt.NoBrush)
-        painter.drawRoundedRect(t_rect, 14.0, 14.0)
-
-        painter.setPen(QPen(QColor(255, 255, 255)))
-        painter.drawText(t_rect, Qt.AlignCenter, toggle_text)
-
-        x += tw + 12.0
-
-        # Vertical separator
-        painter.setPen(QPen(QColor(255, 255, 255, 40), 1.5))
-        painter.drawLine(QPointF(x, y + 4), QPointF(x, y + tab_h - 4))
-        x += 12.0
-
-        # 2. Scene Tabs
+        # Draw Scene Tabs
         for idx, view in enumerate(self.data.saved_views):
             vname = view.get("name", f"Scene {idx}")
             vtype = view.get("type", "custom")
@@ -1584,7 +1511,7 @@ class PerspectiveMatcherPlugin:
 
             x += tab_w + 6.0
 
-        # 3. Add Scene Button [+]
+        # Add Scene Button [+]
         add_btn_w = 28.0
         add_rect = QRectF(x, y, add_btn_w, tab_h)
         self.add_view_rect = add_rect
@@ -1602,7 +1529,7 @@ class PerspectiveMatcherPlugin:
 
         x += add_btn_w + 6.0
 
-        # 4. Calibrate Real Scale Button [📏]
+        # Calibrate Real Scale Button [📏]
         scale_btn_w = 32.0
         scale_rect = QRectF(x, y, scale_btn_w, tab_h)
         self.scale_tool_rect = scale_rect
@@ -1621,12 +1548,12 @@ class PerspectiveMatcherPlugin:
         painter.restore()
 
     def _draw_loupe(self, viewport, painter: QPainter, hx: float, hy: float, handle_name: str) -> None:
-        """Draws magnifying zoom loupe around active handle during dragging."""
+        """Draws clean circular magnifying zoom loupe around active handle without confusing text."""
         w, h = viewport.width(), viewport.height()
-        radius = 75.0
+        radius = 70.0
 
         lx = hx + 55.0
-        ly = hy - 95.0
+        ly = hy - 90.0
 
         if lx + radius > w - 15:
             lx = hx - 55.0 - 2 * radius
@@ -1643,7 +1570,7 @@ class PerspectiveMatcherPlugin:
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
 
-        # Leader line from handle to loupe edge
+        # Subtle leader line from handle to loupe edge
         ldx = lx - hx
         ldy = ly - hy
         llen = math.hypot(ldx, ldy)
@@ -1708,11 +1635,11 @@ class PerspectiveMatcherPlugin:
 
         # Center crosshairs
         painter.setPen(QPen(QColor(0, 0, 0, 200), 2.0))
-        painter.drawLine(QPointF(lx - 20, ly), QPointF(lx + 20, ly))
-        painter.drawLine(QPointF(lx, ly - 20), QPointF(lx, ly + 20))
+        painter.drawLine(QPointF(lx - 18, ly), QPointF(lx + 18, ly))
+        painter.drawLine(QPointF(lx, ly - 18), QPointF(lx, ly + 18))
         painter.setPen(QPen(QColor(255, 255, 255, 240), 1.0))
-        painter.drawLine(QPointF(lx - 20, ly), QPointF(lx + 20, ly))
-        painter.drawLine(QPointF(lx, ly - 20), QPointF(lx, ly + 20))
+        painter.drawLine(QPointF(lx - 18, ly), QPointF(lx + 18, ly))
+        painter.drawLine(QPointF(lx, ly - 18), QPointF(lx, ly + 18))
 
         # Center pinpoint
         painter.setBrush(QBrush(handle_color))
@@ -1721,60 +1648,41 @@ class PerspectiveMatcherPlugin:
 
         painter.setClipping(False)
 
-        # Outer border rings
+        # Clean outer border rings (No confusing dark badges attached)
         painter.setBrush(Qt.NoBrush)
-        painter.setPen(QPen(QColor(0, 0, 0, 180), 4.5))
+        painter.setPen(QPen(QColor(0, 0, 0, 180), 4.0))
         painter.drawEllipse(loupe_center, radius + 1.5, radius + 1.5)
 
-        painter.setPen(QPen(handle_color, 3.0))
+        painter.setPen(QPen(handle_color, 2.5))
         painter.drawEllipse(loupe_center, radius, radius)
 
         painter.setPen(QPen(QColor(255, 255, 255, 200), 1.0))
         painter.drawEllipse(loupe_center, radius - 2.0, radius - 2.0)
 
-        # Dynamic status badge below loupe
-        badge_w = 170.0
-        badge_h = 22.0
-        badge_x = lx - badge_w / 2.0
-        badge_y = ly + radius + 6.0
-        if badge_y + badge_h > h - 5:
-            badge_y = ly - radius - badge_h - 6.0
-        badge_rect = QRectF(badge_x, badge_y, badge_w, badge_h)
-
-        painter.setPen(Qt.NoPen)
-        if self.filter.is_shift_held:
-            painter.setBrush(QBrush(QColor(16, 140, 72, 230)))
-        else:
-            painter.setBrush(QBrush(QColor(24, 26, 32, 220)))
-        painter.drawRoundedRect(badge_rect, 11.0, 11.0)
-
-        painter.setPen(QPen(QColor(255, 255, 255, 80), 1.0))
-        painter.drawRoundedRect(badge_rect, 11.0, 11.0)
-
-        font = QFont("Segoe UI", 8)
-        font.setBold(True)
-        painter.setFont(font)
-        painter.setPen(QPen(Qt.white))
-        if self.filter.is_shift_held:
-            badge_text = "⚡ 4× PRECISION (0.2×)"
-        else:
-            badge_text = "🔍 4× ZOOM [Shift: Precision]"
-        painter.drawText(badge_rect, Qt.AlignCenter, badge_text)
-
         painter.restore()
 
     def draw_overlay(self, viewport, painter: QPainter) -> None:
-        """Draws SketchUp-style Scene Tabs, Background Photo, Vanishing Guides, and Precision Loupe."""
-        w, h = viewport.width(), viewport.height()
-
-        # 1. ALWAYS Draw Scene Tabs Bar at top of viewport
-        self._draw_scene_tabs(viewport, painter)
-
-        # 2. If Perspective Match is disabled, do not draw photo or guides!
+        """Draws SketchUp-style Scene Tabs, Background Photo, Vanishing Guides, and Bottom Help Text."""
         if not self.data.enabled:
             return
 
-        # 3. Draw Background Photograph
+        w, h = viewport.width(), viewport.height()
+
+        # 1. ALWAYS Draw Scene Tabs Bar at top when match mode is enabled
+        self._draw_scene_tabs(viewport, painter)
+
+        # 2. Check active view tab
+        is_match_tab = (
+            self.data.active_view_index < len(self.data.saved_views)
+            and self.data.saved_views[self.data.active_view_index].get("type") == "match"
+        )
+
+        if not is_match_tab:
+            # When viewing standard Perspective (3D orbit) or custom scenes:
+            # Leave viewport completely clean for normal 3D orbiting/zooming!
+            return
+
+        # 3. Draw Background Photograph (in Match view only)
         if self.data.show_image and self.pixmap is not None and not self.pixmap.isNull():
             painter.save()
             painter.setOpacity(self.data.image_opacity)
@@ -1786,7 +1694,7 @@ class PerspectiveMatcherPlugin:
             painter.drawPixmap(int(dx), int(dy), scaled)
             painter.restore()
 
-        # 4. Draw Guides
+        # 4. Draw Reference Guides
         if not self.data.show_guides:
             return
 
@@ -1807,7 +1715,6 @@ class PerspectiveMatcherPlugin:
             p2_a: QPointF, p2_b: QPointF,
             color: QColor,
             vp_pt: Optional[Tuple[float, float]],
-            name1: str, name2: str,
             handle_a1: str, handle_b1: str,
             handle_a2: str, handle_b2: str
         ) -> None:
@@ -1821,6 +1728,7 @@ class PerspectiveMatcherPlugin:
                 dash_pen = QPen(QColor(color.red(), color.green(), color.blue(), 140), 1.0, Qt.DashLine)
                 painter.setPen(dash_pen)
                 painter.drawLine(p1_b, vp_q)
+                painter.drawLine(p2_a, vp_q)
                 painter.drawLine(p2_b, vp_q)
 
             draw_handle(p1_a, color, handle_a1)
@@ -1846,7 +1754,7 @@ class PerspectiveMatcherPlugin:
         px2_a, px2_b = to_px(self.data.x2_a), to_px(self.data.x2_b)
         draw_line_pair(
             px1_a, px1_b, px2_a, px2_b, COLOR_X, self.solved.vp_x,
-            "X1", "X2", "x1_a", "x1_b", "x2_a", "x2_b"
+            "x1_a", "x1_b", "x2_a", "x2_b"
         )
 
         # Draw Y lines (Green)
@@ -1854,7 +1762,7 @@ class PerspectiveMatcherPlugin:
         py2_a, py2_b = to_px(self.data.y2_a), to_px(self.data.y2_b)
         draw_line_pair(
             py1_a, py1_b, py2_a, py2_b, COLOR_Y, self.solved.vp_y,
-            "Y1", "Y2", "y1_a", "y1_b", "y2_a", "y2_b"
+            "y1_a", "y1_b", "y2_a", "y2_b"
         )
 
         # Draw Z lines (Blue) if 3-point mode
@@ -1863,7 +1771,7 @@ class PerspectiveMatcherPlugin:
             pz2_a, pz2_b = to_px(self.data.z2_a), to_px(self.data.z2_b)
             draw_line_pair(
                 pz1_a, pz1_b, pz2_a, pz2_b, COLOR_Z, self.solved.vp_z,
-                "Z1", "Z2", "z1_a", "z1_b", "z2_a", "z2_b"
+                "z1_a", "z1_b", "z2_a", "z2_b"
             )
 
         # Draw Horizon Line between Vx and Vy
@@ -1914,29 +1822,33 @@ class PerspectiveMatcherPlugin:
             sign = 1.0 if self.data.invert_z else -1.0
             painter.drawLine(p_orig, QPointF(p_orig.x(), p_orig.y() + sign * arm))
 
-        painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
-        painter.setPen(QPen(QColor(255, 255, 255, 220)))
-        painter.drawText(QPointF(p_orig.x() + 10, p_orig.y() + 14), "Origin (0,0,0)")
-
-        # Calibration HUD Badge at Bottom-Left
-        badge_rect = QRectF(12, h - 38, 320, 26)
+        # Bottom SketchUp-Style Prompt and Guidance Bar
+        guide_rect = QRectF(12, h - 36, w - 24, 26)
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QBrush(QColor(20, 22, 28, 190)))
-        painter.drawRoundedRect(badge_rect, 5.0, 5.0)
+        painter.setBrush(QBrush(QColor(18, 20, 26, 210)))
+        painter.drawRoundedRect(guide_rect, 4.0, 4.0)
 
         font = QFont("Segoe UI", 9)
         font.setBold(True)
         painter.setFont(font)
-        painter.setPen(QPen(QColor(240, 240, 240)))
-        status_txt = (
-            f"🎯 f: {self.solved.focal_35mm:.1f}mm | FOV: {self.solved.fov_deg:.1f}° | "
-            f"P: {self.solved.pitch_deg:.1f}° | Y: {self.solved.yaw_deg:.1f}°"
-        )
-        painter.drawText(badge_rect.adjusted(8, 0, 0, 0), Qt.AlignVCenter | Qt.AlignLeft, status_txt)
+
+        if self.filter.is_shift_held:
+            painter.setPen(QPen(QColor(76, 175, 80)))
+            guide_msg = "⚡ PRECISION MODE ACTIVE (0.2×): Drag handles slowly to calibrate • Release Shift for normal speed"
+        else:
+            painter.setPen(QPen(QColor(230, 230, 230)))
+            guide_msg = "💡 Drag red/green/blue handles to match photo • Hold Shift for precision zoom • Click [Perspective] to orbit 3D"
+
+        painter.drawText(guide_rect.adjusted(10, 0, -10, 0), Qt.AlignVCenter | Qt.AlignLeft, guide_msg)
+
+        # Right-aligned camera info readout in bottom bar
+        status_txt = f"🎯 f: {self.solved.focal_35mm:.1f}mm | FOV: {self.solved.fov_deg:.1f}°"
+        painter.setPen(QPen(QColor(180, 190, 205)))
+        painter.drawText(guide_rect.adjusted(0, 0, -12, 0), Qt.AlignVCenter | Qt.AlignRight, status_txt)
 
         painter.restore()
 
-        # 5. Draw precision loupe if a handle is actively being dragged
+        # 5. Draw clean optical loupe during dragging (No dark text clutter)
         if self.filter.active_handle is not None:
             rel = getattr(self.data, self.filter.active_handle, None)
             if rel is not None:
@@ -1945,7 +1857,7 @@ class PerspectiveMatcherPlugin:
                 self._draw_loupe(viewport, painter, hx, hy, self.filter.active_handle)
 
 
-# ---- Entry point -----------------------------------------------------------
+# ---- Extension Setup Entry Point -------------------------------------------
 _GLOBAL_PLUGIN: Optional[PerspectiveMatcherPlugin] = None
 
 
@@ -1967,4 +1879,4 @@ def setup(app) -> None:
         tip="Match viewport perspective to reference photograph (SketchUp / Blender style)."
     )
 
-    app.on_document_changed(lambda: plugin.panel.refresh_ui())
+    app.on_document_changed(lambda: plugin.on_document_changed())
