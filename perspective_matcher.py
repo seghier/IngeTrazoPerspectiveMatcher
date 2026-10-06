@@ -337,7 +337,7 @@ class PerspectiveMatchData:
         self.show_image: bool = True
         self.show_guides: bool = True
         self.camera_locked: bool = False
-        self.mode: str = "3point"  # "2point" or "3point"
+        self.mode: str = "2point"  # "2point" (default SketchUp style) or "3point"
         self.distance: float = 30.0  # meters from origin
         self.cumulative_scale: float = 1.0  # Tracks cumulative scale relative to original model (1.0 = baseline)
         self.scale_model_with_view: bool = False  # OFF by default to protect model dimensions and takeoffs
@@ -347,15 +347,16 @@ class PerspectiveMatchData:
         self.swap_xy: bool = False
 
         # Relative handle coordinates (rx, ry) in [0.0, 1.0] across viewport
-        self.x1_a = [0.38, 0.44]
-        self.x1_b = [0.18, 0.49]
-        self.x2_a = [0.38, 0.65]
-        self.x2_b = [0.18, 0.74]
+        # Standard architectural outside corner (SketchUp style): Red (X) on Right, Green (Y) on Left
+        self.x1_a = [0.62, 0.44]
+        self.x1_b = [0.82, 0.49]
+        self.x2_a = [0.62, 0.65]
+        self.x2_b = [0.82, 0.74]
 
-        self.y1_a = [0.62, 0.44]
-        self.y1_b = [0.82, 0.49]
-        self.y2_a = [0.62, 0.65]
-        self.y2_b = [0.82, 0.74]
+        self.y1_a = [0.38, 0.44]
+        self.y1_b = [0.18, 0.49]
+        self.y2_a = [0.38, 0.65]
+        self.y2_b = [0.18, 0.74]
 
         self.z1_a = [0.40, 0.22]
         self.z1_b = [0.38, 0.72]
@@ -438,7 +439,7 @@ class PerspectiveMatchData:
         self.show_image = bool(d.get("show_image", self.show_image))
         self.show_guides = bool(d.get("show_guides", self.show_guides))
         self.camera_locked = bool(d.get("camera_locked", self.camera_locked))
-        self.mode = str(d.get("mode", self.mode))
+        self.mode = str(d.get("mode", "2point"))
         self.distance = float(d.get("distance", self.distance))
         self.cumulative_scale = float(d.get("cumulative_scale", 1.0))
         self.scale_model_with_view = bool(d.get("scale_model_with_view", False))
@@ -476,6 +477,9 @@ class SolvedCameraParams:
         self.v_x_cam: List[float] = [1.0, 0.0, 0.0]
         self.v_y_cam: List[float] = [0.0, 1.0, 0.0]
         self.v_z_cam: List[float] = [0.0, 0.0, 1.0]
+        self.screen_x_dir: Tuple[float, float] = (1.0, 0.0)
+        self.screen_y_dir: Tuple[float, float] = (0.0, 1.0)
+        self.screen_z_dir: Tuple[float, float] = (0.0, -1.0)
         self.vp_x: Optional[Tuple[float, float]] = None
         self.vp_y: Optional[Tuple[float, float]] = None
         self.vp_z: Optional[Tuple[float, float]] = None
@@ -674,7 +678,7 @@ def solve_perspective(
         nz = rx[0] * ry[1] - rx[1] * ry[0]
         dot_n = nx * rz[0] + ny * rz[1] + nz * rz[2]
         if dot_n < 0:
-            ry = [-c for c in ry]
+            rx, ry = ry, rx
 
         # Solve nearest orthogonal rotation matrix via polar decomposition
         M = [
@@ -687,14 +691,30 @@ def solve_perspective(
         vy = [R[0][1], R[1][1], R[2][1]]
         vz = [R[0][2], R[1][2], R[2][2]]
     else:
-        # 2-point mode: verticals stay strictly vertical
-        vx = rx
-        dot_xy_cam = vx[0] * ry[0] + vx[1] * ry[1] + vx[2] * ry[2]
-        vy = [ry[0] - dot_xy_cam * vx[0], ry[1] - dot_xy_cam * vx[1], ry[2] - dot_xy_cam * vx[2]]
+        # 2-point mode: solve horizontal bases with automatic right-handed chirality (+Z up)
+        # Cross product Y-component in camera frame:
+        # cy = rx[2]*ry[0] - rx[0]*ry[2]
+        # In camera frame, +Y is UP. If cy < 0, rx is on the left of ry.
+        # To maintain a valid right-handed Cartesian coordinate system where World +Z is UP,
+        # the right-hand receding axis is +X and the left-hand receding axis is +Y.
+        # Swapping them ensures both axes point FORWARD into the scene along the visible walls,
+        # preventing any axis from being flipped 180 degrees behind the camera.
+        cross_y = rx[2] * ry[0] - rx[0] * ry[2]
+        if cross_y < 0:
+            vx = ry
+            vy = rx
+        else:
+            vx = rx
+            vy = ry
+
+        # Gram-Schmidt: orthogonalize vy against vx
+        dot_xy_cam = vx[0] * vy[0] + vx[1] * vy[1] + vx[2] * vy[2]
+        vy = [vy[0] - dot_xy_cam * vx[0], vy[1] - dot_xy_cam * vx[1], vy[2] - dot_xy_cam * vx[2]]
         len_vy = math.hypot(*vy)
         if len_vy > 1e-6:
             vy = [c / len_vy for c in vy]
 
+        # World Z is cross product of vx and vy (points UP by construction)
         vz = [
             vx[1] * vy[2] - vx[2] * vy[1],
             vx[2] * vy[0] - vx[0] * vy[2],
@@ -703,13 +723,12 @@ def solve_perspective(
         len_vz = math.hypot(*vz)
         if len_vz > 1e-6:
             vz = [c / len_vz for c in vz]
+
         if vz[1] < 0:
             vz = [-c for c in vz]
-            vy = [
-                vz[1] * vx[2] - vz[2] * vx[1],
-                vz[2] * vx[0] - vz[0] * vx[2],
-                vz[0] * vx[1] - vz[1] * vx[0]
-            ]
+
+        if data.invert_z:
+            vz = [-c for c in vz]
 
     res.v_x_cam = vx
     res.v_y_cam = vy
@@ -737,7 +756,7 @@ def solve_perspective(
         up_z /= len_up
     res.up_w = QVector3D(up_x, up_y, up_z)
 
-    pitch_rad = math.asin(max(-1.0, min(1.0, -fwd_z)))
+    pitch_rad = math.asin(max(-1.0, min(1.0, fwd_z)))
     yaw_rad = math.atan2(-fwd_y, -fwd_x)
     res.pitch_deg = math.degrees(pitch_rad)
     res.yaw_deg = math.degrees(yaw_rad)
@@ -762,6 +781,45 @@ def solve_perspective(
 
     if vp_x is not None and vp_y is not None:
         res.horizon = (vp_x, vp_y)
+
+    # 5. Vanishing Z computation (exact 3rd vanishing point in both 2-point and 3-point modes)
+    if res.vp_z is None and abs(vz[2]) > 1e-5:
+        vz_x = cx - f * (vz[0] / vz[2])
+        vz_y = cy + f * (vz[1] / vz[2])
+        res.vp_z = (vz_x, vz_y)
+
+    # 6. Screen-projected direction vectors of the 3D axes at the Origin
+    z0_cam = -dist * (f / len_r0)
+    x0_cam = dist * (du0 / len_r0)
+    y0_cam = dist * (dv0 / len_r0)
+
+    # Derivative of screen projection (x, y) with respect to World X at Origin
+    dx_x = x0_cam * vx[2] - z0_cam * vx[0]
+    dy_x = vx[1] * z0_cam - y0_cam * vx[2]
+    len_dir_x = math.hypot(dx_x, dy_x)
+    res.screen_x_dir = (dx_x / len_dir_x, dy_x / len_dir_x) if len_dir_x > 1e-6 else (1.0, 0.0)
+
+    # Derivative of screen projection (x, y) with respect to World Y at Origin
+    dx_y = x0_cam * vy[2] - z0_cam * vy[0]
+    dy_y = vy[1] * z0_cam - y0_cam * vy[2]
+    len_dir_y = math.hypot(dx_y, dy_y)
+    res.screen_y_dir = (dx_y / len_dir_y, dy_y / len_dir_y) if len_dir_y > 1e-6 else (0.0, 1.0)
+
+    # Derivative of screen projection (x, y) with respect to World Z at Origin
+    # This gives the exact perspective slope of any vertical line passing through the Origin!
+    dx_z = x0_cam * vz[2] - z0_cam * vz[0]
+    dy_z = vz[1] * z0_cam - y0_cam * vz[2]
+    len_dir_z = math.hypot(dx_z, dy_z)
+    if len_dir_z > 1e-6:
+        dx_z /= len_dir_z
+        dy_z /= len_dir_z
+        # In screen coords, dy < 0 is upward towards sky unless invert_z
+        if not data.invert_z and dy_z > 0:
+            dx_z = -dx_z
+            dy_z = -dy_z
+        res.screen_z_dir = (dx_z, dy_z)
+    else:
+        res.screen_z_dir = (0.0, -1.0)
 
     return res
 
@@ -951,20 +1009,30 @@ class PerspectiveEventFilter(QObject):
             if self.active_handle is not None and (event.buttons() & Qt.LeftButton):
                 self.is_shift_held = bool(event.modifiers() & Qt.ShiftModifier)
 
-                if self.is_shift_held and self.last_mouse_pos is not None:
+                if self.active_handle == "line_z_origin":
+                    if self.last_mouse_pos is not None:
+                        dx = pos.x() - self.last_mouse_pos.x()
+                        dy = pos.y() - self.last_mouse_pos.y()
+                        scale = 0.2 if self.is_shift_held else 1.0
+                        cur = self.plugin.data.origin
+                        rx = max(0.005, min(0.995, cur[0] + (dx * scale) / w))
+                        ry = max(0.005, min(0.995, cur[1] + (dy * scale) / h))
+                        self.plugin.data.origin = [rx, ry]
+                elif self.is_shift_held and self.last_mouse_pos is not None:
                     # Precision slow-motion mode (0.2x delta)
                     dx = pos.x() - self.last_mouse_pos.x()
                     dy = pos.y() - self.last_mouse_pos.y()
                     cur = getattr(self.plugin.data, self.active_handle)
                     rx = max(0.005, min(0.995, cur[0] + (dx * 0.2) / w))
                     ry = max(0.005, min(0.995, cur[1] + (dy * 0.2) / h))
+                    setattr(self.plugin.data, self.active_handle, [rx, ry])
                 else:
                     # Direct 1:1 positioning
                     rx = max(0.005, min(0.995, pos.x() / w))
                     ry = max(0.005, min(0.995, pos.y() / h))
+                    setattr(self.plugin.data, self.active_handle, [rx, ry])
 
                 self.last_mouse_pos = pos
-                setattr(self.plugin.data, self.active_handle, [rx, ry])
 
                 # Live solve & align camera
                 self.plugin.update_camera_from_guides()
@@ -992,6 +1060,21 @@ class PerspectiveEventFilter(QObject):
 
         return False
 
+    @staticmethod
+    def _is_near_segment(pt: Tuple[float, float], a: Tuple[float, float], b: Tuple[float, float], tol: float) -> bool:
+        px, py = pt
+        ax, ay = a
+        bx, by = b
+        dx = bx - ax
+        dy = by - ay
+        len_sq = dx * dx + dy * dy
+        if len_sq < 1e-6:
+            return math.hypot(px - ax, py - ay) <= tol
+        t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / len_sq))
+        proj_x = ax + t * dx
+        proj_y = ay + t * dy
+        return math.hypot(px - proj_x, py - proj_y) <= tol
+
     def _hit_test(self, px: float, py: float, w: int, h: int) -> Optional[str]:
         handles = [
             "x1_a", "x1_b", "x2_a", "x2_b",
@@ -1008,6 +1091,19 @@ class PerspectiveEventFilter(QObject):
             hx, hy = rel[0] * w, rel[1] * h
             if math.hypot(px - hx, py - hy) <= self.HIT_RADIUS:
                 return name
+
+        # Check Blue Vertical Axis through Origin (line_z_origin) - ALWAYS active in all modes
+        if hasattr(self.plugin, "solved") and hasattr(self.plugin.solved, "screen_z_dir"):
+            dx_z, dy_z = self.plugin.solved.screen_z_dir
+            orig = self.plugin.data.origin
+            ox, oy = orig[0] * w, orig[1] * h
+            extent_up = max(w, h) * 1.5
+            z_top = (ox + dx_z * extent_up, oy + dy_z * extent_up)
+            z_bottom = (ox - dx_z * 140.0, oy - dy_z * 140.0)
+
+            if self._is_near_segment((px, py), z_bottom, z_top, self.HIT_RADIUS):
+                return "line_z_origin"
+
         return None
 
     def _hit_test_tabs(self, px: float, py: float) -> Optional[int]:
@@ -1206,8 +1302,8 @@ class PerspectiveMatcherPanel(QWidget):
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel(_t("Perspective Mode:")))
         self.combo_mode = QComboBox()
-        self.combo_mode.addItem(_t("2-Point (Verticals stay vertical)"), "2point")
-        self.combo_mode.addItem(_t("3-Point (Tilted camera)"), "3point")
+        self.combo_mode.addItem(_t("2-Point Perspective (SketchUp Style • Auto Z)"), "2point")
+        self.combo_mode.addItem(_t("3-Point Perspective (Manual Z1/Z2 Guides)"), "3point")
         self.combo_mode.currentIndexChanged.connect(self._on_mode_changed)
         mode_row.addWidget(self.combo_mode)
         solve_lay.addLayout(mode_row)
@@ -2210,12 +2306,8 @@ class PerspectiveMatcherPlugin:
         cam = vp.camera
         cam.fov_deg = self.solved.fov_deg
         cam.distance = self.data.distance
-        if self.data.mode == "3point":
-            cam.up = self.solved.up_w
-            cam.two_point = False
-        else:
-            cam.up = QVector3D(0.0, 0.0, 1.0)
-            cam.two_point = True
+        cam.up = self.solved.up_w
+        cam.two_point = False
         cam.look_from(self.solved.eye, self.solved.forward)
         if self.data.camera_locked:
             self.locked_camera_state = get_camera_state(cam)
@@ -2583,32 +2675,47 @@ class PerspectiveMatcherPlugin:
         # True 3D Origin Perspective Axes Gizmo
         arm = 42.0
 
-        # World X (Red)
-        dx_x = self.solved.v_x_cam[0]
-        dy_x = -self.solved.v_x_cam[1]
-        l_x = math.hypot(dx_x, dy_x)
-        if l_x > 1e-4:
-            painter.setPen(QPen(COLOR_X, 2.8))
-            painter.drawLine(p_orig, QPointF(p_orig.x() + arm * dx_x / l_x,
-                                            p_orig.y() + arm * dy_x / l_x))
+        # World X (Red) - Points towards Vanishing Point X
+        dx_x, dy_x = self.solved.screen_x_dir
+        painter.setPen(QPen(COLOR_X, 2.8))
+        painter.drawLine(p_orig, QPointF(p_orig.x() + arm * dx_x,
+                                        p_orig.y() + arm * dy_x))
 
-        # World Y (Green)
-        dx_y = self.solved.v_y_cam[0]
-        dy_y = -self.solved.v_y_cam[1]
-        l_y = math.hypot(dx_y, dy_y)
-        if l_y > 1e-4:
-            painter.setPen(QPen(COLOR_Y, 2.8))
-            painter.drawLine(p_orig, QPointF(p_orig.x() + arm * dx_y / l_y,
-                                            p_orig.y() + arm * dy_y / l_y))
+        # World Y (Green) - Points towards Vanishing Point Y
+        dx_y, dy_y = self.solved.screen_y_dir
+        painter.setPen(QPen(COLOR_Y, 2.8))
+        painter.drawLine(p_orig, QPointF(p_orig.x() + arm * dx_y,
+                                        p_orig.y() + arm * dy_y))
 
-        # World Z (Blue)
-        dx_z = self.solved.v_z_cam[0]
-        dy_z = -self.solved.v_z_cam[1]
-        l_z = math.hypot(dx_z, dy_z)
-        if l_z > 1e-4:
-            painter.setPen(QPen(COLOR_Z, 2.8))
-            painter.drawLine(p_orig, QPointF(p_orig.x() + arm * dx_z / l_z,
-                                            p_orig.y() + arm * dy_z / l_z))
+        # World Z (Blue) - ALWAYS visible, anchored to Origin, with TRUE perspective convergence to Vz (matching SketchUp)
+        dx_z, dy_z = self.solved.screen_z_dir
+        extent_up = max(w, h) * 1.5
+        extent_down = 140.0
+
+        z_top = QPointF(p_orig.x() + dx_z * extent_up, p_orig.y() + dy_z * extent_up)
+        z_bottom = QPointF(p_orig.x() - dx_z * extent_down, p_orig.y() - dy_z * extent_down)
+
+        is_z_hover = (getattr(self.filter, "hovered_handle", None) == "line_z_origin" or
+                      getattr(self.filter, "active_handle", None) == "line_z_origin")
+        z_thick = 4.5 if is_z_hover else 2.8
+
+        # Positive Z vertical axis extending upwards across scene towards vertical vanishing point
+        painter.setPen(QPen(COLOR_Z, z_thick))
+        painter.drawLine(p_orig, z_top)
+
+        # Negative Z extension into ground
+        painter.setPen(QPen(QColor(0, 102, 255, 120), 1.8, Qt.DashLine))
+        painter.drawLine(p_orig, z_bottom)
+
+        # Axis label "+Z"
+        label_dist = min(220.0, max(70.0, p_orig.y() - 30.0))
+        z_label_pt = QPointF(p_orig.x() + dx_z * label_dist + (8 if dx_z >= 0 else -22),
+                             p_orig.y() + dy_z * label_dist - 8)
+        font_z = QFont("Segoe UI", 9)
+        font_z.setBold(True)
+        painter.setFont(font_z)
+        painter.setPen(QPen(COLOR_Z))
+        painter.drawText(z_label_pt, "+Z")
 
         # Bottom SketchUp-Style Prompt and Guidance Bar
         guide_rect = QRectF(12, h - 36, w - 24, 26)
@@ -2623,9 +2730,12 @@ class PerspectiveMatcherPlugin:
         if getattr(self.filter, "is_shift_held", False):
             painter.setPen(QPen(QColor(76, 175, 80)))
             guide_msg = "⚡ PRECISION MODE ACTIVE (0.2×): Drag handles slowly to calibrate • Release Shift for normal speed"
+        elif getattr(self.filter, "active_handle", None) == "line_z_origin":
+            painter.setPen(QPen(QColor(255, 215, 0)))
+            guide_msg = "💡 Moving Origin & Z-Axis Guide • Drag to building corner • Hold Shift for precision (0.2×)"
         else:
             painter.setPen(QPen(QColor(230, 230, 230)))
-            guide_msg = "💡 Drag red/green/blue handles to match photo • Hold Shift for precision zoom • Click [Default 3D] to orbit 3D"
+            guide_msg = "💡 Drag red/green handles to match photo • Blue Z line tracks building tilt • Click [Default 3D] to orbit 3D"
 
         painter.drawText(guide_rect.adjusted(10, 0, -10, 0), Qt.AlignVCenter | Qt.AlignLeft, guide_msg)
 
@@ -2638,12 +2748,14 @@ class PerspectiveMatcherPlugin:
 
         # 5. Draw clean optical loupe during dragging (No dark text clutter)
         if getattr(self.filter, "active_handle", None) is not None:
-            rel = getattr(self.data, self.filter.active_handle, None)
+            active_h = self.filter.active_handle
+            handle_to_zoom = "origin" if active_h == "line_z_origin" else active_h
+            rel = getattr(self.data, handle_to_zoom, None)
             if rel is not None:
                 hx = rel[0] * w
                 hy = rel[1] * h
                 try:
-                    self._draw_loupe(viewport, painter, hx, hy, self.filter.active_handle)
+                    self._draw_loupe(viewport, painter, hx, hy, active_h)
                 except Exception:
                     pass
 
