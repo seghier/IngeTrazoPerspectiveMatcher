@@ -31,6 +31,24 @@ def _t(text: str) -> str:
     return text
 
 
+def get_image_rect(view_w: float, view_h: float, img_w: int, img_h: int) -> QRectF:
+    """Computes the exact bounding rectangle of the photograph within the viewport,
+    preserving aspect ratio (letterbox / pillarbox), matching Qt.KeepAspectRatio."""
+    if img_w <= 0 or img_h <= 0:
+        return QRectF(0.0, 0.0, max(view_w, 100.0), max(view_h, 100.0))
+    aspect = img_w / img_h
+    avail_aspect = max(view_w, 1.0) / max(view_h, 1.0)
+    if aspect > avail_aspect:
+        draw_w = view_w
+        draw_h = max(10.0, view_w / aspect)
+    else:
+        draw_h = view_h
+        draw_w = max(10.0, view_h * aspect)
+    draw_x = (view_w - draw_w) / 2.0
+    draw_y = (view_h - draw_h) / 2.0
+    return QRectF(draw_x, draw_y, draw_w, draw_h)
+
+
 # ---- Camera State Helpers --------------------------------------------------
 def get_camera_state(cam) -> Dict[str, Any]:
     """Extracts IngeTrazo's OrbitCamera state into a JSON-safe dictionary.
@@ -333,6 +351,8 @@ class PerspectiveMatchData:
 
         self.image_path: str = ""
         self.image_b64: str = ""
+        self.image_width: int = 0
+        self.image_height: int = 0
         self.image_opacity: float = 0.55
         self.show_image: bool = True
         self.show_guides: bool = True
@@ -341,6 +361,7 @@ class PerspectiveMatchData:
         self.distance: float = 30.0  # meters from origin
         self.cumulative_scale: float = 1.0  # Tracks cumulative scale relative to original model (1.0 = baseline)
         self.scale_model_with_view: bool = False  # OFF by default to protect model dimensions and takeoffs
+        self.fix_verticals: bool = True  # Architectural 2-Point Vertical Alignment (Level Horizon)
         self.invert_x: bool = False
         self.invert_y: bool = False
         self.invert_z: bool = False
@@ -398,6 +419,8 @@ class PerspectiveMatchData:
             "saved_views": list(self.saved_views),
             "image_path": self.image_path,
             "image_b64": self.image_b64,
+            "image_width": self.image_width,
+            "image_height": self.image_height,
             "image_opacity": self.image_opacity,
             "show_image": self.show_image,
             "show_guides": self.show_guides,
@@ -406,6 +429,7 @@ class PerspectiveMatchData:
             "distance": self.distance,
             "cumulative_scale": self.cumulative_scale,
             "scale_model_with_view": self.scale_model_with_view,
+            "fix_verticals": self.fix_verticals,
             "invert_x": self.invert_x,
             "invert_y": self.invert_y,
             "invert_z": self.invert_z,
@@ -435,6 +459,8 @@ class PerspectiveMatchData:
 
         self.image_path = str(d.get("image_path", self.image_path))
         self.image_b64 = str(d.get("image_b64", self.image_b64))
+        self.image_width = int(d.get("image_width", self.image_width))
+        self.image_height = int(d.get("image_height", self.image_height))
         self.image_opacity = float(d.get("image_opacity", self.image_opacity))
         self.show_image = bool(d.get("show_image", self.show_image))
         self.show_guides = bool(d.get("show_guides", self.show_guides))
@@ -443,6 +469,7 @@ class PerspectiveMatchData:
         self.distance = float(d.get("distance", self.distance))
         self.cumulative_scale = float(d.get("cumulative_scale", 1.0))
         self.scale_model_with_view = bool(d.get("scale_model_with_view", False))
+        self.fix_verticals = bool(d.get("fix_verticals", True))
         self.invert_x = bool(d.get("invert_x", self.invert_x))
         self.invert_y = bool(d.get("invert_y", self.invert_y))
         self.invert_z = bool(d.get("invert_z", self.invert_z))
@@ -484,6 +511,8 @@ class SolvedCameraParams:
         self.vp_y: Optional[Tuple[float, float]] = None
         self.vp_z: Optional[Tuple[float, float]] = None
         self.horizon: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None
+        self.principal_point_px: Tuple[float, float] = (0.0, 0.0)
+        self.principal_point_norm: Tuple[float, float] = (0.5, 0.5)
 
 
 def mat3_inv(m: List[List[float]]) -> Optional[List[List[float]]]:
@@ -548,16 +577,25 @@ def nearest_rotation_matrix(m: List[List[float]]) -> List[List[float]]:
 def solve_perspective(
     data: PerspectiveMatchData,
     view_width: float,
-    view_height: float
+    view_height: float,
+    img_width: int = 0,
+    img_height: int = 0
 ) -> SolvedCameraParams:
     """Solves focal length, FOV, camera rotation, and eye position from guides.
     Supports both 2-point mode and full 3-point perspective with active Z-axis influence."""
     res = SolvedCameraParams()
     W, H = max(view_width, 100.0), max(view_height, 100.0)
-    cx, cy = W / 2.0, H / 2.0
+
+    if img_width <= 0:
+        img_width = getattr(data, "image_width", 0)
+    if img_height <= 0:
+        img_height = getattr(data, "image_height", 0)
+
+    img_rect = get_image_rect(W, H, img_width, img_height)
 
     def to_px(rel_pt: List[float]) -> Tuple[float, float]:
-        return (rel_pt[0] * W, rel_pt[1] * H)
+        return (img_rect.x() + rel_pt[0] * img_rect.width(),
+                img_rect.y() + rel_pt[1] * img_rect.height())
 
     p_x1_a, p_x1_b = to_px(data.x1_a), to_px(data.x1_b)
     p_x2_a, p_x2_b = to_px(data.x2_a), to_px(data.x2_b)
@@ -576,9 +614,33 @@ def solve_perspective(
     res.vp_y = vp_y
     res.vp_z = vp_z
 
+    cx_vp, cy_vp = W / 2.0, H / 2.0
+
     if vp_x is None or vp_y is None:
         res.status_msg = _t("Lines nearly parallel (adjust guides)")
+        res.principal_point_px = (cx_vp, cy_vp)
+        res.principal_point_norm = (0.5, 0.5)
         return res
+
+    if getattr(data, "fix_verticals", True) and data.mode != "3point":
+        # Fix Vertical Lines mode: Optical center automatically placed on vanishing horizon line (Pitch = 0.0°)
+        cx = cx_vp
+        dx = vp_y[0] - vp_x[0]
+        if abs(dx) > 1e-4:
+            target_y_px = vp_x[1] + ((vp_y[1] - vp_x[1]) / dx) * (cx - vp_x[0])
+        else:
+            target_y_px = (vp_x[1] + vp_y[1]) * 0.5
+        cy = target_y_px
+        norm_cy = max(0.001, min(0.999, (cy - img_rect.y()) / max(img_rect.height(), 1.0)))
+        norm_cx = max(0.001, min(0.999, (cx - img_rect.x()) / max(img_rect.width(), 1.0)))
+    else:
+        cx = cx_vp
+        cy = cy_vp
+        norm_cx = 0.50
+        norm_cy = 0.50
+
+    res.principal_point_px = (cx, cy)
+    res.principal_point_norm = (norm_cx, norm_cy)
 
     # 2D Screen to Camera coordinate offsets (Y inverted in camera frame)
     du_x = vp_x[0] - cx
@@ -758,7 +820,10 @@ def solve_perspective(
 
     pitch_rad = math.asin(max(-1.0, min(1.0, fwd_z)))
     yaw_rad = math.atan2(-fwd_y, -fwd_x)
-    res.pitch_deg = math.degrees(pitch_rad)
+    if getattr(data, "fix_verticals", True) and data.mode != "3point":
+        res.pitch_deg = 0.0
+    else:
+        res.pitch_deg = math.degrees(pitch_rad)
     res.yaw_deg = math.degrees(yaw_rad)
 
     u0, v0 = to_px(data.origin)
@@ -860,6 +925,12 @@ class PerspectiveEventFilter(QObject):
 
         # If perspective match is disabled and camera is not locked, leave viewport interactions 100% untouched
         if not self.plugin.data.enabled and not self.plugin.data.camera_locked:
+            return False
+
+        # Viewport resize: keep camera, solver, and guides in sync with photograph
+        if t == QEvent.Resize:
+            if self.plugin.data.enabled:
+                self.plugin.update_camera_from_guides()
             return False
 
         # 2. Top Scene Tabs Bar Interactions (When Match is Enabled)
@@ -1005,6 +1076,9 @@ class PerspectiveEventFilter(QObject):
         elif t == QEvent.MouseMove:
             pos = event.position() if hasattr(event, "position") else QPointF(event.pos())
             w, h = max(vp.width(), 100), max(vp.height(), 100)
+            img_rect = self.plugin.get_image_rect(w, h)
+            img_w = max(img_rect.width(), 10.0)
+            img_h = max(img_rect.height(), 10.0)
 
             if self.active_handle is not None and (event.buttons() & Qt.LeftButton):
                 self.is_shift_held = bool(event.modifiers() & Qt.ShiftModifier)
@@ -1015,21 +1089,21 @@ class PerspectiveEventFilter(QObject):
                         dy = pos.y() - self.last_mouse_pos.y()
                         scale = 0.2 if self.is_shift_held else 1.0
                         cur = self.plugin.data.origin
-                        rx = max(0.005, min(0.995, cur[0] + (dx * scale) / w))
-                        ry = max(0.005, min(0.995, cur[1] + (dy * scale) / h))
+                        rx = max(0.005, min(0.995, cur[0] + (dx * scale) / img_w))
+                        ry = max(0.005, min(0.995, cur[1] + (dy * scale) / img_h))
                         self.plugin.data.origin = [rx, ry]
                 elif self.is_shift_held and self.last_mouse_pos is not None:
                     # Precision slow-motion mode (0.2x delta)
                     dx = pos.x() - self.last_mouse_pos.x()
                     dy = pos.y() - self.last_mouse_pos.y()
                     cur = getattr(self.plugin.data, self.active_handle)
-                    rx = max(0.005, min(0.995, cur[0] + (dx * 0.2) / w))
-                    ry = max(0.005, min(0.995, cur[1] + (dy * 0.2) / h))
+                    rx = max(0.005, min(0.995, cur[0] + (dx * 0.2) / img_w))
+                    ry = max(0.005, min(0.995, cur[1] + (dy * 0.2) / img_h))
                     setattr(self.plugin.data, self.active_handle, [rx, ry])
                 else:
-                    # Direct 1:1 positioning
-                    rx = max(0.005, min(0.995, pos.x() / w))
-                    ry = max(0.005, min(0.995, pos.y() / h))
+                    # Direct 1:1 positioning within the photograph
+                    rx = max(0.005, min(0.995, (pos.x() - img_rect.x()) / img_w))
+                    ry = max(0.005, min(0.995, (pos.y() - img_rect.y()) / img_h))
                     setattr(self.plugin.data, self.active_handle, [rx, ry])
 
                 self.last_mouse_pos = pos
@@ -1076,6 +1150,7 @@ class PerspectiveEventFilter(QObject):
         return math.hypot(px - proj_x, py - proj_y) <= tol
 
     def _hit_test(self, px: float, py: float, w: int, h: int) -> Optional[str]:
+        img_rect = self.plugin.get_image_rect(w, h)
         handles = [
             "x1_a", "x1_b", "x2_a", "x2_b",
             "y1_a", "y1_b", "y2_a", "y2_b",
@@ -1088,7 +1163,8 @@ class PerspectiveEventFilter(QObject):
             rel = getattr(self.plugin.data, name, None)
             if rel is None:
                 continue
-            hx, hy = rel[0] * w, rel[1] * h
+            hx = img_rect.x() + rel[0] * img_rect.width()
+            hy = img_rect.y() + rel[1] * img_rect.height()
             if math.hypot(px - hx, py - hy) <= self.HIT_RADIUS:
                 return name
 
@@ -1096,7 +1172,8 @@ class PerspectiveEventFilter(QObject):
         if hasattr(self.plugin, "solved") and hasattr(self.plugin.solved, "screen_z_dir"):
             dx_z, dy_z = self.plugin.solved.screen_z_dir
             orig = self.plugin.data.origin
-            ox, oy = orig[0] * w, orig[1] * h
+            ox = img_rect.x() + orig[0] * img_rect.width()
+            oy = img_rect.y() + orig[1] * img_rect.height()
             extent_up = max(w, h) * 1.5
             z_top = (ox + dx_z * extent_up, oy + dy_z * extent_up)
             z_bottom = (ox - dx_z * 140.0, oy - dy_z * 140.0)
@@ -1308,6 +1385,15 @@ class PerspectiveMatcherPanel(QWidget):
         mode_row.addWidget(self.combo_mode)
         solve_lay.addLayout(mode_row)
 
+        self.chk_fix_verticals = QCheckBox(_t("Fix Vertical Lines (Level Horizon)"))
+        self.chk_fix_verticals.setChecked(getattr(self.plugin.data, "fix_verticals", True))
+        self.chk_fix_verticals.setStyleSheet("font-weight: bold; color: #FFA726;")
+        self.chk_fix_verticals.setToolTip(
+            _t("Keeps all vertical lines 100% vertical and displays the orange level horizon line (pitch = 0.0°)")
+        )
+        self.chk_fix_verticals.toggled.connect(self._on_toggle_fix_verticals)
+        solve_lay.addWidget(self.chk_fix_verticals)
+
         inv_row1 = QHBoxLayout()
         self.chk_inv_x = QCheckBox(_t("Invert X Axis"))
         self.chk_inv_x.setChecked(self.plugin.data.invert_x)
@@ -1425,7 +1511,7 @@ class PerspectiveMatcherPanel(QWidget):
 
         for w in (self.slider_opacity, self.chk_show_photo, self.chk_show_guides,
                   self.chk_lock_cam, self.spin_dist, self.slider_scale, self.chk_inv_x, self.chk_inv_y,
-                  self.chk_inv_z, self.chk_swap_xy, self.combo_mode):
+                  self.chk_inv_z, self.chk_swap_xy, self.combo_mode, self.chk_fix_verticals):
             w.blockSignals(True)
 
         self.slider_opacity.setValue(int(self.plugin.data.image_opacity * 100))
@@ -1439,13 +1525,15 @@ class PerspectiveMatcherPanel(QWidget):
         self.chk_inv_y.setChecked(self.plugin.data.invert_y)
         self.chk_inv_z.setChecked(self.plugin.data.invert_z)
         self.chk_swap_xy.setChecked(self.plugin.data.swap_xy)
+        self.chk_fix_verticals.setChecked(getattr(self.plugin.data, "fix_verticals", True))
+        self.chk_fix_verticals.setEnabled(self.plugin.data.mode != "3point")
         idx = self.combo_mode.findData(self.plugin.data.mode)
         if idx >= 0:
             self.combo_mode.setCurrentIndex(idx)
 
         for w in (self.slider_opacity, self.chk_show_photo, self.chk_show_guides,
                   self.chk_lock_cam, self.spin_dist, self.slider_scale, self.chk_inv_x, self.chk_inv_y,
-                  self.chk_inv_z, self.chk_swap_xy, self.combo_mode):
+                  self.chk_inv_z, self.chk_swap_xy, self.combo_mode, self.chk_fix_verticals):
             w.blockSignals(False)
 
         if hasattr(self, "btn_lock_cam"):
@@ -1503,7 +1591,8 @@ class PerspectiveMatcherPanel(QWidget):
     def update_readouts(self, solved: SolvedCameraParams) -> None:
         self.lbl_focal.setText(f"{solved.focal_35mm:.1f} mm (35mm eq.)")
         self.lbl_fov.setText(f"{solved.fov_deg:.1f}°")
-        self.lbl_orient.setText(f"Pitch: {solved.pitch_deg:.1f}° | Yaw: {solved.yaw_deg:.1f}°")
+        pitch_str = "0.0° [Fixed]" if (getattr(self.plugin.data, "fix_verticals", True) and self.plugin.data.mode != "3point") else f"{solved.pitch_deg:.1f}°"
+        self.lbl_orient.setText(f"Pitch: {pitch_str} | Yaw: {solved.yaw_deg:.1f}°")
         self.lbl_status.setText(solved.status_msg)
         if solved.valid:
             self.lbl_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
@@ -1595,6 +1684,7 @@ class PerspectiveMatcherPanel(QWidget):
 
     def _on_mode_changed(self) -> None:
         self.plugin.data.mode = self.combo_mode.currentData()
+        self.chk_fix_verticals.setEnabled(self.plugin.data.mode != "3point")
         self.plugin.update_camera_from_guides()
         self.plugin.save_state()
 
@@ -1670,6 +1760,11 @@ class PerspectiveMatcherPanel(QWidget):
         self.plugin.update_camera_from_guides()
         self.plugin.save_state()
 
+    def _on_toggle_fix_verticals(self, checked: bool) -> None:
+        self.plugin.data.fix_verticals = checked
+        self.plugin.update_camera_from_guides()
+        self.plugin.save_state()
+
     def _on_reset_guides(self) -> None:
         d = PerspectiveMatchData()
         d.image_path = self.plugin.data.image_path
@@ -1679,6 +1774,7 @@ class PerspectiveMatcherPanel(QWidget):
         d.saved_views = self.plugin.data.saved_views
         d.active_view_index = self.plugin.data.active_view_index
         d.enabled = self.plugin.data.enabled
+        d.fix_verticals = self.plugin.data.fix_verticals
         self.plugin.data = d
         self.refresh_ui()
         self.plugin.update_camera_from_guides()
@@ -1758,6 +1854,13 @@ class PerspectiveMatcherPlugin:
                 self.data.enabled = True
             self._restore_photo()
 
+    def get_image_rect(self, view_w: float, view_h: float) -> QRectF:
+        """Returns the bounding rectangle of the photograph within the viewport,
+        preserving aspect ratio (letterbox / pillarbox), matching Qt.KeepAspectRatio."""
+        img_w = self.pixmap.width() if (self.pixmap is not None and not self.pixmap.isNull()) else getattr(self.data, "image_width", 0)
+        img_h = self.pixmap.height() if (self.pixmap is not None and not self.pixmap.isNull()) else getattr(self.data, "image_height", 0)
+        return get_image_rect(view_w, view_h, img_w, img_h)
+
     def _restore_photo(self) -> None:
         """Restores QPixmap from file path, candidate user folders, or embedded base64."""
         # 1. Try exact image_path on disk
@@ -1765,6 +1868,8 @@ class PerspectiveMatcherPlugin:
             pm = QPixmap(self.data.image_path)
             if pm is not None and not pm.isNull():
                 self.pixmap = pm
+                self.data.image_width = pm.width()
+                self.data.image_height = pm.height()
                 self._ensure_b64_backup()
                 return
 
@@ -1784,6 +1889,8 @@ class PerspectiveMatcherPlugin:
                     if pm is not None and not pm.isNull():
                         self.data.image_path = cpath
                         self.pixmap = pm
+                        self.data.image_width = pm.width()
+                        self.data.image_height = pm.height()
                         self._ensure_b64_backup()
                         return
 
@@ -1801,6 +1908,8 @@ class PerspectiveMatcherPlugin:
                                 if pm is not None and not pm.isNull():
                                     self.data.image_path = fpath
                                     self.pixmap = pm
+                                    self.data.image_width = pm.width()
+                                    self.data.image_height = pm.height()
                                     self._ensure_b64_backup()
                                     return
                     except Exception:
@@ -1814,6 +1923,8 @@ class PerspectiveMatcherPlugin:
                 pm.loadFromData(ba)
                 if not pm.isNull():
                     self.pixmap = pm
+                    self.data.image_width = pm.width()
+                    self.data.image_height = pm.height()
                     return
             except Exception:
                 pass
@@ -1846,6 +1957,9 @@ class PerspectiveMatcherPlugin:
         if os.path.isfile(path):
             self.data.image_path = path
             self.pixmap = QPixmap(path)
+            if self.pixmap is not None and not self.pixmap.isNull():
+                self.data.image_width = self.pixmap.width()
+                self.data.image_height = self.pixmap.height()
             try:
                 with open(path, "rb") as f:
                     raw = f.read()
@@ -1866,6 +1980,8 @@ class PerspectiveMatcherPlugin:
     def clear_image(self) -> None:
         self.data.image_path = ""
         self.data.image_b64 = ""
+        self.data.image_width = 0
+        self.data.image_height = 0
         self.pixmap = None
         self.save_state()
         self.app.viewport.update()
@@ -2051,7 +2167,9 @@ class PerspectiveMatcherPlugin:
 
             # 4. Re-solve perspective with updated distance
             w, h = max(vp.width(), 100), max(vp.height(), 100)
-            self.solved = solve_perspective(self.data, w, h)
+            img_w = self.pixmap.width() if (self.pixmap is not None and not self.pixmap.isNull()) else getattr(self.data, "image_width", 0)
+            img_h = self.pixmap.height() if (self.pixmap is not None and not self.pixmap.isNull()) else getattr(self.data, "image_height", 0)
+            self.solved = solve_perspective(self.data, w, h, img_w, img_h)
             if self.panel is not None:
                 self.panel.update_readouts(self.solved)
 
@@ -2064,13 +2182,22 @@ class PerspectiveMatcherPlugin:
                 cam = vp.camera
                 cam.fov_deg = self.solved.fov_deg
                 cam.distance = self.data.distance
-                if self.data.mode == "3point":
-                    cam.up = self.solved.up_w
-                    cam.two_point = False
-                else:
+                if getattr(self.data, "fix_verticals", True) and self.data.mode != "3point":
                     cam.up = QVector3D(0.0, 0.0, 1.0)
                     cam.two_point = True
-                cam.look_from(self.solved.eye, self.solved.forward)
+                    level = QVector3D(self.solved.forward.x(), self.solved.forward.y(), 0.0)
+                    if level.length() < 1e-4:
+                        level = QVector3D(0.0, 1.0, 0.0)
+                    level.normalize()
+                    cy = self.solved.principal_point_px[1]
+                    f = max(10.0, self.solved.focal_px)
+                    slope_z = (cy - h / 2.0) / f
+                    cam_dir = QVector3D(level.x(), level.y(), slope_z).normalized()
+                    cam.look_from(self.solved.eye, cam_dir)
+                else:
+                    cam.up = self.solved.up_w
+                    cam.two_point = False
+                    cam.look_from(self.solved.eye, self.solved.forward)
             else:
                 cam = vp.camera
                 cam.distance *= factor
@@ -2288,7 +2415,9 @@ class PerspectiveMatcherPlugin:
         """Solves perspective from current guides and sets IngeTrazo's OrbitCamera."""
         vp = self.app.viewport
         w, h = max(vp.width(), 100), max(vp.height(), 100)
-        self.solved = solve_perspective(self.data, w, h)
+        img_w = self.pixmap.width() if (self.pixmap is not None and not self.pixmap.isNull()) else getattr(self.data, "image_width", 0)
+        img_h = self.pixmap.height() if (self.pixmap is not None and not self.pixmap.isNull()) else getattr(self.data, "image_height", 0)
+        self.solved = solve_perspective(self.data, w, h, img_w, img_h)
         if self.panel is not None:
             self.panel.update_readouts(self.solved)
 
@@ -2306,9 +2435,22 @@ class PerspectiveMatcherPlugin:
         cam = vp.camera
         cam.fov_deg = self.solved.fov_deg
         cam.distance = self.data.distance
-        cam.up = self.solved.up_w
-        cam.two_point = False
-        cam.look_from(self.solved.eye, self.solved.forward)
+        if getattr(self.data, "fix_verticals", True) and self.data.mode != "3point":
+            cam.up = QVector3D(0.0, 0.0, 1.0)
+            cam.two_point = True
+            level = QVector3D(self.solved.forward.x(), self.solved.forward.y(), 0.0)
+            if level.length() < 1e-4:
+                level = QVector3D(0.0, 1.0, 0.0)
+            level.normalize()
+            cy = self.solved.principal_point_px[1]
+            f = max(10.0, self.solved.focal_px)
+            slope_z = (cy - h / 2.0) / f
+            cam_dir = QVector3D(level.x(), level.y(), slope_z).normalized()
+            cam.look_from(self.solved.eye, cam_dir)
+        else:
+            cam.up = self.solved.up_w
+            cam.two_point = False
+            cam.look_from(self.solved.eye, self.solved.forward)
         if self.data.camera_locked:
             self.locked_camera_state = get_camera_state(cam)
         vp.update()
@@ -2562,16 +2704,12 @@ class PerspectiveMatcherPlugin:
             return
 
         # 3. Draw Background Photograph (in Match view only)
+        img_rect = self.get_image_rect(w, h)
         if self.data.show_image and self.pixmap is not None and not self.pixmap.isNull():
             try:
                 painter.save()
                 painter.setOpacity(self.data.image_opacity)
-                scaled = self.pixmap.scaled(
-                    w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation
-                )
-                dx = (w - scaled.width()) / 2
-                dy = (h - scaled.height()) / 2
-                painter.drawPixmap(int(dx), int(dy), scaled)
+                painter.drawPixmap(img_rect.toRect(), self.pixmap)
                 painter.restore()
             except Exception:
                 pass
@@ -2584,7 +2722,8 @@ class PerspectiveMatcherPlugin:
         painter.setRenderHint(QPainter.Antialiasing, True)
 
         def to_px(rel_pt: List[float]) -> QPointF:
-            return QPointF(rel_pt[0] * w, rel_pt[1] * h)
+            return QPointF(img_rect.x() + rel_pt[0] * img_rect.width(),
+                           img_rect.y() + rel_pt[1] * img_rect.height())
 
         COLOR_X = QColor(255, 59, 48)
         COLOR_Y = QColor(52, 199, 89)
@@ -2604,17 +2743,6 @@ class PerspectiveMatcherPlugin:
             painter.setPen(pen)
             painter.drawLine(p1_a, p1_b)
             painter.drawLine(p2_a, p2_b)
-
-            if vp_pt is not None:
-                vx, vy = vp_pt
-                if not (math.isnan(vx) or math.isnan(vy) or math.isinf(vx) or math.isinf(vy)):
-                    if abs(vx) < 50000 and abs(vy) < 50000:
-                        vp_q = QPointF(vx, vy)
-                        dash_pen = QPen(QColor(color.red(), color.green(), color.blue(), 140), 1.0, Qt.DashLine)
-                        painter.setPen(dash_pen)
-                        painter.drawLine(p1_b, vp_q)
-                        painter.drawLine(p2_a, vp_q)
-                        painter.drawLine(p2_b, vp_q)
 
             draw_handle(p1_a, color, handle_a1)
             draw_handle(p1_b, color, handle_b1)
@@ -2659,14 +2787,41 @@ class PerspectiveMatcherPlugin:
                 "z1_a", "z1_b", "z2_a", "z2_b"
             )
 
-        # Draw Horizon Line between Vx and Vy
+        # Draw Horizon Line across viewport
         if self.solved.horizon is not None:
             (vx1, vy1), (vx2, vy2) = self.solved.horizon
             if not any(math.isnan(c) or math.isinf(c) for c in (vx1, vy1, vx2, vy2)):
-                if all(abs(c) < 50000 for c in (vx1, vy1, vx2, vy2)):
-                    pen_h = QPen(COLOR_HORIZON, 1.5, Qt.DashDotLine)
+                hdx = vx2 - vx1
+                hdy = vy2 - vy1
+                if abs(hdx) > 1e-4:
+                    slope = hdy / hdx
+                    y_at_0 = vy1 - slope * vx1
+                    y_at_w = vy1 + slope * (w - vx1)
+
+                    is_level = (getattr(self.data, "fix_verticals", True) and self.data.mode != "3point")
+                    if is_level:
+                        active_horizon_color = QColor(255, 125, 0)  # Vivid deep neon orange
+                        active_horizon_thick = 3.0
+                        h_label = _t("Level Horizon (Verticals Fixed)")
+                        # Contrast shadow backing for orange horizon line
+                        painter.setPen(QPen(QColor(20, 20, 20, 100), 4.5, Qt.SolidLine))
+                        painter.drawLine(QPointF(0.0, y_at_0 + 1.0), QPointF(float(w), y_at_w + 1.0))
+                    else:
+                        active_horizon_color = QColor(255, 214, 10, 180)  # Golden yellow
+                        active_horizon_thick = 1.5
+                        h_label = _t("Horizon")
+
+                    pen_h = QPen(active_horizon_color, active_horizon_thick, Qt.SolidLine if is_level else Qt.DashDotLine)
                     painter.setPen(pen_h)
-                    painter.drawLine(QPointF(vx1, vy1), QPointF(vx2, vy2))
+                    painter.drawLine(QPointF(0.0, y_at_0), QPointF(float(w), y_at_w))
+
+                    # Draw horizon label
+                    font_h = QFont("Segoe UI", 9)
+                    font_h.setBold(True)
+                    painter.setFont(font_h)
+                    painter.setPen(QPen(active_horizon_color))
+                    y_lbl = max(14.0, min(float(h) - 20.0, y_at_0 - 16.0))
+                    painter.drawText(QPointF(15.0, y_lbl), h_label)
 
         # Draw Origin Handle
         p_orig = to_px(self.data.origin)
@@ -2717,6 +2872,49 @@ class PerspectiveMatcherPlugin:
         painter.setPen(QPen(COLOR_Z))
         painter.drawText(z_label_pt, "+Z")
 
+        # Draw Principal Point (Optical Center) Indicator - ALWAYS VISIBLE, NOT DRAGGABLE
+        pp_x, pp_y = getattr(self.solved, "principal_point_px", (w / 2.0, h / 2.0))
+        if (not (math.isnan(pp_x) or math.isnan(pp_y)) and
+            pp_x >= -500.0 and pp_x <= w + 500.0 and
+            pp_y >= -500.0 and pp_y <= h + 500.0):
+            pp_pt = QPointF(pp_x, pp_y)
+            pp_color = QColor(255, 125, 0)       # Vivid deep neon orange (matches level horizon)
+            pp_shadow = QColor(20, 20, 20, 140)  # Contrast dark backing
+
+            # Subtle vertical center guide line through the optical center (X = cx)
+            painter.setPen(QPen(pp_shadow, 2.0))
+            painter.drawLine(QPointF(pp_x, 0.0), QPointF(pp_x, float(h)))
+            painter.setPen(QPen(QColor(255, 125, 0, 140), 1.0))
+            painter.drawLine(QPointF(pp_x, 0.0), QPointF(pp_x, float(h)))
+
+            reticle_r = 10.0
+
+            # Outer shadow ring + crisp orange ring
+            painter.setPen(QPen(pp_shadow, 2.0))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(pp_pt, reticle_r + 1.0, reticle_r + 1.0)
+
+            painter.setPen(QPen(pp_color, 2.0))
+            painter.drawEllipse(pp_pt, reticle_r, reticle_r)
+
+            # Center dot
+            painter.setPen(QPen(pp_shadow, 1.0))
+            painter.setBrush(QBrush(Qt.white))
+            painter.drawEllipse(pp_pt, 3.0, 3.0)
+
+            # Precision crosshair tick marks
+            painter.setPen(QPen(pp_shadow, 3.0))
+            painter.drawLine(QPointF(pp_x - reticle_r - 5.0, pp_y), QPointF(pp_x - reticle_r + 2.0, pp_y))
+            painter.drawLine(QPointF(pp_x + reticle_r - 2.0, pp_y), QPointF(pp_x + reticle_r + 5.0, pp_y))
+            painter.drawLine(QPointF(pp_x, pp_y - reticle_r - 5.0), QPointF(pp_x, pp_y - reticle_r + 2.0))
+            painter.drawLine(QPointF(pp_x, pp_y + reticle_r - 2.0), QPointF(pp_x, pp_y + reticle_r + 5.0))
+
+            painter.setPen(QPen(pp_color, 1.5))
+            painter.drawLine(QPointF(pp_x - reticle_r - 5.0, pp_y), QPointF(pp_x - reticle_r + 2.0, pp_y))
+            painter.drawLine(QPointF(pp_x + reticle_r - 2.0, pp_y), QPointF(pp_x + reticle_r + 5.0, pp_y))
+            painter.drawLine(QPointF(pp_x, pp_y - reticle_r - 5.0), QPointF(pp_x, pp_y - reticle_r + 2.0))
+            painter.drawLine(QPointF(pp_x, pp_y + reticle_r - 2.0), QPointF(pp_x, pp_y + reticle_r + 5.0))
+
         # Bottom SketchUp-Style Prompt and Guidance Bar
         guide_rect = QRectF(12, h - 36, w - 24, 26)
         painter.setPen(Qt.NoPen)
@@ -2752,8 +2950,8 @@ class PerspectiveMatcherPlugin:
             handle_to_zoom = "origin" if active_h == "line_z_origin" else active_h
             rel = getattr(self.data, handle_to_zoom, None)
             if rel is not None:
-                hx = rel[0] * w
-                hy = rel[1] * h
+                hx = img_rect.x() + rel[0] * img_rect.width()
+                hy = img_rect.y() + rel[1] * img_rect.height()
                 try:
                     self._draw_loupe(viewport, painter, hx, hy, active_h)
                 except Exception:
