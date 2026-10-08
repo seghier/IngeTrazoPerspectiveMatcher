@@ -1,13 +1,13 @@
 id = "perspective_matcher"
-version = "1.3"
+version = "1.4"
 author = "seghier"
 author_url = "https://github.com/seghier"
 
 license = "GPL-3.0-or-later"
 repository = "https://github.com/seghier/IngeTrazoPerspectiveMatcher"
 
-download = "https://github.com/seghier/IngeTrazoPerspectiveMatcher/releases/download/v1.3/perspective_matcher.zip"
-sha256 = "75e6cc3d8e8943e73223f2da22b5a497e33335c4ec4c234fbc47d27d9ddd3e3e"
+download = "https://github.com/seghier/IngeTrazoPerspectiveMatcher/releases/download/v1.4/perspective_matcher.zip"
+sha256 = "47ef28a85a7ce6622d6e6fa05e2d5ca14689f38a40891cfea35d1fe5e2fb6207"
 
 ingetrazo = "0.5.7"
 tags = ["architecture", "drawing", "productivity"]

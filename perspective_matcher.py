@@ -21,8 +21,9 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMessageBox, QPushButton, QSlider, QVBoxLayout, QWidget
+    QFrame, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSlider,
+    QSpinBox, QToolButton, QVBoxLayout, QWidget
 )
 
 
@@ -47,6 +48,37 @@ def get_image_rect(view_w: float, view_h: float, img_w: int, img_h: int) -> QRec
     draw_x = (view_w - draw_w) / 2.0
     draw_y = (view_h - draw_h) / 2.0
     return QRectF(draw_x, draw_y, draw_w, draw_h)
+
+
+def clip_line_to_rect(
+    ax: float, ay: float, dx: float, dy: float,
+    left: float, top: float, right: float, bottom: float
+) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    """Liang-Barsky 2D line clipping of infinite line (ax, ay) + t*(dx, dy) to rect."""
+    t_min = -1e9
+    t_max = 1e9
+
+    if abs(dx) > 1e-9:
+        t1 = (left - ax) / dx
+        t2 = (right - ax) / dx
+        t_min = max(t_min, min(t1, t2))
+        t_max = min(t_max, max(t1, t2))
+    else:
+        if ax < left or ax > right:
+            return None
+
+    if abs(dy) > 1e-9:
+        t1 = (top - ay) / dy
+        t2 = (bottom - ay) / dy
+        t_min = max(t_min, min(t1, t2))
+        t_max = min(t_max, max(t1, t2))
+    else:
+        if ay < top or ay > bottom:
+            return None
+
+    if t_max >= t_min:
+        return ((ax + t_min * dx, ay + t_min * dy), (ax + t_max * dx, ay + t_max * dy))
+    return None
 
 
 # ---- Camera State Helpers --------------------------------------------------
@@ -362,6 +394,13 @@ class PerspectiveMatchData:
         self.cumulative_scale: float = 1.0  # Tracks cumulative scale relative to original model (1.0 = baseline)
         self.scale_model_with_view: bool = False  # OFF by default to protect model dimensions and takeoffs
         self.fix_verticals: bool = True  # Architectural 2-Point Vertical Alignment (Level Horizon)
+        self.show_infinite_guides: bool = True
+        self.show_vertical_hairlines: bool = True
+        self.vertical_hairlines_count: int = 9
+        self.show_x_hairlines: bool = False
+        self.x_hairlines_count: int = 7
+        self.show_y_hairlines: bool = False
+        self.y_hairlines_count: int = 7
         self.invert_x: bool = False
         self.invert_y: bool = False
         self.invert_z: bool = False
@@ -430,6 +469,13 @@ class PerspectiveMatchData:
             "cumulative_scale": self.cumulative_scale,
             "scale_model_with_view": self.scale_model_with_view,
             "fix_verticals": self.fix_verticals,
+            "show_infinite_guides": self.show_infinite_guides,
+            "show_vertical_hairlines": self.show_vertical_hairlines,
+            "vertical_hairlines_count": self.vertical_hairlines_count,
+            "show_x_hairlines": self.show_x_hairlines,
+            "x_hairlines_count": self.x_hairlines_count,
+            "show_y_hairlines": self.show_y_hairlines,
+            "y_hairlines_count": self.y_hairlines_count,
             "invert_x": self.invert_x,
             "invert_y": self.invert_y,
             "invert_z": self.invert_z,
@@ -470,6 +516,13 @@ class PerspectiveMatchData:
         self.cumulative_scale = float(d.get("cumulative_scale", 1.0))
         self.scale_model_with_view = bool(d.get("scale_model_with_view", False))
         self.fix_verticals = bool(d.get("fix_verticals", True))
+        self.show_infinite_guides = bool(d.get("show_infinite_guides", True))
+        self.show_vertical_hairlines = bool(d.get("show_vertical_hairlines", True))
+        self.vertical_hairlines_count = int(d.get("vertical_hairlines_count", 9))
+        self.show_x_hairlines = bool(d.get("show_x_hairlines", False))
+        self.x_hairlines_count = int(d.get("x_hairlines_count", 7))
+        self.show_y_hairlines = bool(d.get("show_y_hairlines", False))
+        self.y_hairlines_count = int(d.get("y_hairlines_count", 7))
         self.invert_x = bool(d.get("invert_x", self.invert_x))
         self.invert_y = bool(d.get("invert_y", self.invert_y))
         self.invert_z = bool(d.get("invert_z", self.invert_z))
@@ -1190,6 +1243,61 @@ class PerspectiveEventFilter(QObject):
         return None
 
 
+# ---- Collapsible Section Helper -------------------------------------------
+class CollapsibleSection(QWidget):
+    """A clean, collapsible panel section with a toggle arrow header."""
+
+    def __init__(self, title: str, parent=None, collapsed: bool = False) -> None:
+        super().__init__(parent)
+        self._lay = QVBoxLayout(self)
+        self._lay.setContentsMargins(0, 0, 0, 0)
+        self._lay.setSpacing(2)
+
+        self._btn = QToolButton(self)
+        self._btn.setText(f"  {title}")
+        self._btn.setCheckable(True)
+        self._btn.setChecked(not collapsed)
+        self._btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._btn.setArrowType(Qt.DownArrow if not collapsed else Qt.RightArrow)
+        self._btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._btn.setStyleSheet(
+            "QToolButton {"
+            "  font-weight: bold;"
+            "  font-size: 11px;"
+            "  padding: 5px 6px;"
+            "  border: 1px solid rgba(255, 255, 255, 0.08);"
+            "  border-radius: 4px;"
+            "  background-color: rgba(255, 255, 255, 0.05);"
+            "  color: #ECEFF4;"
+            "  text-align: left;"
+            "}"
+            "QToolButton:hover {"
+            "  background-color: rgba(255, 255, 255, 0.10);"
+            "  color: #FFFFFF;"
+            "}"
+            "QToolButton:checked {"
+            "  background-color: rgba(255, 255, 255, 0.07);"
+            "}"
+        )
+        self._btn.toggled.connect(self._on_toggle)
+
+        self.content = QWidget(self)
+        self.content_lay = QVBoxLayout(self.content)
+        self.content_lay.setContentsMargins(4, 4, 4, 6)
+        self.content_lay.setSpacing(5)
+        self.content.setVisible(not collapsed)
+
+        self._lay.addWidget(self._btn)
+        self._lay.addWidget(self.content)
+
+    def _on_toggle(self, checked: bool) -> None:
+        self.content.setVisible(checked)
+        self._btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+
+    def setCollapsed(self, collapsed: bool) -> None:
+        self._btn.setChecked(not collapsed)
+
+
 # ---- Side Tray UI Panel ---------------------------------------------------
 class PerspectiveMatcherPanel(QWidget):
     """Side panel for controlling perspective match photo, guides, scenes, and scale."""
@@ -1200,33 +1308,57 @@ class PerspectiveMatcherPanel(QWidget):
         self._init_ui()
 
     def _init_ui(self) -> None:
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(6, 6, 6, 6)
-        lay.setSpacing(8)
+        root_lay = QVBoxLayout(self)
+        root_lay.setContentsMargins(2, 2, 2, 2)
+        root_lay.setSpacing(4)
 
-        # --- Master Enable / Disable Toggle Checkbox ---
+        # 1. Pinned Master Enable / Disable Toggle (always visible at top of tray)
+        top_bar = QWidget()
+        top_lay = QHBoxLayout(top_bar)
+        top_lay.setContentsMargins(4, 2, 4, 2)
+        top_lay.setSpacing(4)
+
         self.chk_match_enabled = QCheckBox(_t("Enable Perspective Match"))
         self.chk_match_enabled.setStyleSheet(
-            "QCheckBox { font-size: 13px; font-weight: bold; color: #4CAF50; padding: 4px; }"
+            "QCheckBox { font-size: 13px; font-weight: bold; color: #4CAF50; padding: 2px; }"
             if self.plugin.data.enabled else
-            "QCheckBox { font-size: 13px; font-weight: bold; color: #B0BEC5; padding: 4px; }"
+            "QCheckBox { font-size: 13px; font-weight: bold; color: #B0BEC5; padding: 2px; }"
         )
         self.chk_match_enabled.setChecked(self.plugin.data.enabled)
         self.chk_match_enabled.toggled.connect(self._on_master_toggle_toggled)
-        lay.addWidget(self.chk_match_enabled)
+        top_lay.addWidget(self.chk_match_enabled, stretch=1)
+        root_lay.addWidget(top_bar)
 
-        # --- Saved Views & Scenes Section ---
-        scenes_grp = QGroupBox(_t("Saved Views & Scenes"))
-        scenes_lay = QVBoxLayout(scenes_grp)
-        scenes_lay.setSpacing(6)
+        # 2. Scroll Area for all sections
+        self.scroll = QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll.setStyleSheet(
+            "QScrollArea { border: none; background: transparent; }"
+            "QScrollBar:vertical { width: 8px; background: rgba(0,0,0,0.15); margin: 0px; border-radius: 4px; }"
+            "QScrollBar::handle:vertical { background: rgba(255,255,255,0.22); min-height: 24px; border-radius: 4px; }"
+            "QScrollBar::handle:vertical:hover { background: rgba(255,255,255,0.38); }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
+        )
 
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(2, 2, 4, 6)
+        lay.setSpacing(6)
+
+        # --- Section 1: Saved Views / Scenes ---
+        sec_views = CollapsibleSection(_t("Saved Views / Scenes"), collapsed=False)
         self.views_list = QListWidget()
+        self.views_list.setMaximumHeight(65)
         self.views_list.currentRowChanged.connect(self._on_view_selected)
         self.views_list.itemClicked.connect(lambda item: self._on_view_selected(self.views_list.row(item)))
         self.views_list.itemDoubleClicked.connect(lambda _i: self._on_rename_view())
-        scenes_lay.addWidget(self.views_list)
+        sec_views.content_lay.addWidget(self.views_list)
 
         views_btn_row = QHBoxLayout()
+        views_btn_row.setSpacing(4)
         self.btn_add_view = QPushButton(_t("Save Current"))
         self.btn_add_view.clicked.connect(self._on_add_view)
         self.btn_update_view = QPushButton(_t("Update Camera"))
@@ -1240,14 +1372,176 @@ class PerspectiveMatcherPanel(QWidget):
         views_btn_row.addWidget(self.btn_update_view)
         views_btn_row.addWidget(self.btn_lock_cam)
         views_btn_row.addWidget(self.btn_del_view)
-        scenes_lay.addLayout(views_btn_row)
+        sec_views.content_lay.addLayout(views_btn_row)
+        lay.addWidget(sec_views)
 
-        lay.addWidget(scenes_grp)
+        # --- Section 2: Reference Photograph ---
+        sec_photo = CollapsibleSection(_t("Reference Photograph"), collapsed=False)
 
-        # --- Real-World Scale & Distance Section ---
-        scale_grp = QGroupBox(_t("Real-World Scale & Distance"))
-        scale_lay = QVBoxLayout(scale_grp)
-        scale_lay.setSpacing(6)
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(4)
+        self.btn_load = QPushButton(_t("Load Photograph…"))
+        self.btn_load.clicked.connect(self._on_load_photo)
+        self.btn_clear = QPushButton(_t("Clear Photo"))
+        self.btn_clear.clicked.connect(self._on_clear_photo)
+        btn_row.addWidget(self.btn_load)
+        btn_row.addWidget(self.btn_clear)
+        sec_photo.content_lay.addLayout(btn_row)
+
+        self.lbl_path = QLabel("")
+        self.lbl_path.setStyleSheet("color: #888; font-size: 11px;")
+        self.lbl_path.setWordWrap(True)
+        sec_photo.content_lay.addWidget(self.lbl_path)
+
+        photo_ctrl_row = QHBoxLayout()
+        photo_ctrl_row.setSpacing(6)
+        self.chk_show_photo = QCheckBox(_t("Show Photo"))
+        self.chk_show_photo.setChecked(self.plugin.data.show_image)
+        self.chk_show_photo.toggled.connect(self._on_toggle_show_photo)
+        photo_ctrl_row.addWidget(self.chk_show_photo)
+
+        photo_ctrl_row.addWidget(QLabel(_t("Opacity:")))
+        self.slider_opacity = QSlider(Qt.Horizontal)
+        self.slider_opacity.setRange(0, 100)
+        self.slider_opacity.setValue(int(self.plugin.data.image_opacity * 100))
+        self.slider_opacity.valueChanged.connect(self._on_opacity_changed)
+        self.lbl_opacity = QLabel(f"{int(self.plugin.data.image_opacity * 100)}%")
+        photo_ctrl_row.addWidget(self.slider_opacity, stretch=1)
+        photo_ctrl_row.addWidget(self.lbl_opacity)
+        sec_photo.content_lay.addLayout(photo_ctrl_row)
+        lay.addWidget(sec_photo)
+
+        # --- Section 3: Perspective Guides ---
+        sec_guides = CollapsibleSection(_t("Perspective Guides"), collapsed=False)
+
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(4)
+        mode_row.addWidget(QLabel(_t("Mode:")))
+        self.combo_mode = QComboBox()
+        self.combo_mode.addItem(_t("2-Point Perspective (SketchUp Style • Auto Z)"), "2point")
+        self.combo_mode.addItem(_t("3-Point Perspective (3 Vanishing Points)"), "3point")
+        self.combo_mode.currentIndexChanged.connect(self._on_mode_changed)
+        mode_row.addWidget(self.combo_mode, stretch=1)
+        sec_guides.content_lay.addLayout(mode_row)
+
+        self.chk_fix_verticals = QCheckBox(_t("Fix Vertical Lines (Level Horizon)"))
+        self.chk_fix_verticals.setChecked(getattr(self.plugin.data, "fix_verticals", True))
+        self.chk_fix_verticals.setStyleSheet("font-weight: bold; color: #FFA726;")
+        self.chk_fix_verticals.setToolTip(
+            _t("Forces camera pitch to 0.0° so vertical lines remain strictly parallel and level with the horizon.")
+        )
+        self.chk_fix_verticals.toggled.connect(self._on_toggle_fix_verticals)
+        sec_guides.content_lay.addWidget(self.chk_fix_verticals)
+
+        inv_row1 = QHBoxLayout()
+        self.chk_inv_x = QCheckBox(_t("Invert X Axis"))
+        self.chk_inv_x.setChecked(self.plugin.data.invert_x)
+        self.chk_inv_x.toggled.connect(self._on_toggle_inv_x)
+        self.chk_inv_y = QCheckBox(_t("Invert Y Axis"))
+        self.chk_inv_y.setChecked(self.plugin.data.invert_y)
+        self.chk_inv_y.toggled.connect(self._on_toggle_inv_y)
+        inv_row1.addWidget(self.chk_inv_x)
+        inv_row1.addWidget(self.chk_inv_y)
+        sec_guides.content_lay.addLayout(inv_row1)
+
+        inv_row2 = QHBoxLayout()
+        self.chk_inv_z = QCheckBox(_t("Invert Z Axis"))
+        self.chk_inv_z.setChecked(self.plugin.data.invert_z)
+        self.chk_inv_z.toggled.connect(self._on_toggle_inv_z)
+        self.chk_swap_xy = QCheckBox(_t("Swap X ⇄ Y"))
+        self.chk_swap_xy.setChecked(self.plugin.data.swap_xy)
+        self.chk_swap_xy.toggled.connect(self._on_toggle_swap_xy)
+        inv_row2.addWidget(self.chk_inv_z)
+        inv_row2.addWidget(self.chk_swap_xy)
+        sec_guides.content_lay.addLayout(inv_row2)
+
+        guides_row = QHBoxLayout()
+        self.chk_show_guides = QCheckBox(_t("Show Guides"))
+        self.chk_show_guides.setChecked(self.plugin.data.show_guides)
+        self.chk_show_guides.toggled.connect(self._on_toggle_show_guides)
+        self.chk_show_infinite_guides = QCheckBox(_t("Infinite Thin Guides"))
+        self.chk_show_infinite_guides.setChecked(getattr(self.plugin.data, "show_infinite_guides", True))
+        self.chk_show_infinite_guides.setToolTip(
+            _t("Extends the active X, Y (and Z) guide lines infinitely across the screen with a thin 1px line")
+        )
+        self.chk_show_infinite_guides.toggled.connect(self._on_toggle_show_infinite_guides)
+        guides_row.addWidget(self.chk_show_guides)
+        guides_row.addWidget(self.chk_show_infinite_guides)
+        sec_guides.content_lay.addLayout(guides_row)
+
+        # Hairlines rows
+        z_hair_row = QHBoxLayout()
+        self.chk_show_vertical_hairlines = QCheckBox(_t("Vertical Hairlines (Z)"))
+        self.chk_show_vertical_hairlines.setChecked(getattr(self.plugin.data, "show_vertical_hairlines", True))
+        self.chk_show_vertical_hairlines.setToolTip(
+            _t("Display vertical perspective hairlines across the photograph (tracks 3D perspective convergence to Vz when verticals are not fixed)")
+        )
+        self.chk_show_vertical_hairlines.toggled.connect(self._on_toggle_show_vertical_hairlines)
+        z_hair_row.addWidget(self.chk_show_vertical_hairlines, stretch=1)
+        z_hair_row.addWidget(QLabel(_t("Count:")))
+        self.spin_vertical_hairlines = QSpinBox()
+        self.spin_vertical_hairlines.setFixedWidth(52)
+        self.spin_vertical_hairlines.setRange(2, 50)
+        self.spin_vertical_hairlines.setValue(getattr(self.plugin.data, "vertical_hairlines_count", 9))
+        self.spin_vertical_hairlines.valueChanged.connect(self._on_vertical_hairlines_count_changed)
+        z_hair_row.addWidget(self.spin_vertical_hairlines)
+        sec_guides.content_lay.addLayout(z_hair_row)
+
+        x_hair_row = QHBoxLayout()
+        self.chk_show_x_hairlines = QCheckBox(_t("Red Hairlines (X)"))
+        self.chk_show_x_hairlines.setChecked(getattr(self.plugin.data, "show_x_hairlines", False))
+        self.chk_show_x_hairlines.setToolTip(
+            _t("Display thin dotted red hairlines converging to vanishing point Vx across the photograph")
+        )
+        self.chk_show_x_hairlines.toggled.connect(self._on_toggle_show_x_hairlines)
+        x_hair_row.addWidget(self.chk_show_x_hairlines, stretch=1)
+        x_hair_row.addWidget(QLabel(_t("Count:")))
+        self.spin_x_hairlines = QSpinBox()
+        self.spin_x_hairlines.setFixedWidth(52)
+        self.spin_x_hairlines.setRange(2, 50)
+        self.spin_x_hairlines.setValue(getattr(self.plugin.data, "x_hairlines_count", 7))
+        self.spin_x_hairlines.setEnabled(self.chk_show_x_hairlines.isChecked())
+        self.spin_x_hairlines.valueChanged.connect(self._on_x_hairlines_count_changed)
+        x_hair_row.addWidget(self.spin_x_hairlines)
+        sec_guides.content_lay.addLayout(x_hair_row)
+
+        y_hair_row = QHBoxLayout()
+        self.chk_show_y_hairlines = QCheckBox(_t("Green Hairlines (Y)"))
+        self.chk_show_y_hairlines.setChecked(getattr(self.plugin.data, "show_y_hairlines", False))
+        self.chk_show_y_hairlines.setToolTip(
+            _t("Display thin dotted green hairlines converging to vanishing point Vy across the photograph")
+        )
+        self.chk_show_y_hairlines.toggled.connect(self._on_toggle_show_y_hairlines)
+        y_hair_row.addWidget(self.chk_show_y_hairlines, stretch=1)
+        y_hair_row.addWidget(QLabel(_t("Count:")))
+        self.spin_y_hairlines = QSpinBox()
+        self.spin_y_hairlines.setFixedWidth(52)
+        self.spin_y_hairlines.setRange(2, 50)
+        self.spin_y_hairlines.setValue(getattr(self.plugin.data, "y_hairlines_count", 7))
+        self.spin_y_hairlines.setEnabled(self.chk_show_y_hairlines.isChecked())
+        self.spin_y_hairlines.valueChanged.connect(self._on_y_hairlines_count_changed)
+        y_hair_row.addWidget(self.spin_y_hairlines)
+        sec_guides.content_lay.addLayout(y_hair_row)
+
+        self.chk_lock_cam = QCheckBox(_t("Lock Viewport Camera"))
+        self.chk_lock_cam.setChecked(self.plugin.data.camera_locked)
+        self.chk_lock_cam.toggled.connect(self._on_toggle_lock_cam)
+        sec_guides.content_lay.addWidget(self.chk_lock_cam)
+
+        btn_row2 = QHBoxLayout()
+        btn_row2.setSpacing(4)
+        self.btn_align = QPushButton(_t("Align Camera Now"))
+        self.btn_align.setStyleSheet("background-color: #007ACC; color: white; font-weight: bold; padding: 5px;")
+        self.btn_align.clicked.connect(self.plugin.update_camera_from_guides)
+        self.btn_reset = QPushButton(_t("Reset Default Guides"))
+        self.btn_reset.clicked.connect(self._on_reset_guides)
+        btn_row2.addWidget(self.btn_align)
+        btn_row2.addWidget(self.btn_reset)
+        sec_guides.content_lay.addLayout(btn_row2)
+        lay.addWidget(sec_guides)
+
+        # --- Section 4: Real-World Scale / Distance ---
+        sec_scale = CollapsibleSection(_t("Real-World Scale / Distance"), collapsed=True)
 
         dist_row = QHBoxLayout()
         dist_row.addWidget(QLabel(_t("Camera Distance:")))
@@ -1259,18 +1553,18 @@ class PerspectiveMatcherPanel(QWidget):
         self.spin_dist.setSuffix(" m")
         self.spin_dist.valueChanged.connect(self._on_dist_spin_changed)
         dist_row.addWidget(self.spin_dist)
-        scale_lay.addLayout(dist_row)
+        sec_scale.content_lay.addLayout(dist_row)
 
         slider_row = QHBoxLayout()
         slider_row.addWidget(QLabel(_t("Match Scale:")))
         self.slider_scale = QSlider(Qt.Horizontal)
-        self.slider_scale.setRange(10, 2000)  # 1.0m to 200.0m with 0.1m step
+        self.slider_scale.setRange(10, 2000)
         self.slider_scale.setValue(min(2000, max(10, int(self.plugin.data.distance * 10))))
         self.slider_scale.sliderPressed.connect(self._on_scale_slider_pressed)
         self.slider_scale.valueChanged.connect(self._on_scale_slider_changed)
         self.slider_scale.sliderReleased.connect(self._on_scale_slider_released)
         slider_row.addWidget(self.slider_scale)
-        scale_lay.addLayout(slider_row)
+        sec_scale.content_lay.addLayout(slider_row)
 
         self.chk_scale_scene_with_view = QCheckBox(_t("Scale Model with View (Fixed on Photo)"))
         self.chk_scale_scene_with_view.setChecked(self.plugin.data.scale_model_with_view)
@@ -1279,9 +1573,8 @@ class PerspectiveMatcherPanel(QWidget):
             _t("When enabled, adjusting distance/scale scales 3D scene geometry proportionally so the volume remains 100% fixed on top of the background photograph.")
         )
         self.chk_scale_scene_with_view.toggled.connect(self._on_toggle_scale_scene_with_view)
-        scale_lay.addWidget(self.chk_scale_scene_with_view)
+        sec_scale.content_lay.addWidget(self.chk_scale_scene_with_view)
 
-        # Cumulative Model Scale Status & Reset Row
         scale_status_row = QHBoxLayout()
         self.lbl_scale_factor = QLabel(_t("Scale: 1.000× (Original)"))
         self.lbl_scale_factor.setStyleSheet("color: #88C0D0; font-size: 11px;")
@@ -1292,13 +1585,12 @@ class PerspectiveMatcherPanel(QWidget):
         self.btn_reset_scale.clicked.connect(self._on_reset_scale_clicked)
         self.btn_reset_scale.setEnabled(False)
         scale_status_row.addWidget(self.btn_reset_scale)
-        scale_lay.addLayout(scale_status_row)
+        sec_scale.content_lay.addLayout(scale_status_row)
 
-        # Selected Edge Calibration Sub-section
         self.lbl_selected_edge = QLabel(_t("Select an edge in viewport to calibrate real scale:"))
         self.lbl_selected_edge.setStyleSheet("color: #AAA; font-size: 11px;")
         self.lbl_selected_edge.setWordWrap(True)
-        scale_lay.addWidget(self.lbl_selected_edge)
+        sec_scale.content_lay.addWidget(self.lbl_selected_edge)
 
         cur_row = QHBoxLayout()
         cur_row.addWidget(QLabel(_t("Current Length:")))
@@ -1308,7 +1600,7 @@ class PerspectiveMatcherPanel(QWidget):
         self.spin_current_len.setValue(1.0)
         self.spin_current_len.setSuffix(" m")
         cur_row.addWidget(self.spin_current_len)
-        scale_lay.addLayout(cur_row)
+        sec_scale.content_lay.addLayout(cur_row)
 
         target_row = QHBoxLayout()
         target_row.addWidget(QLabel(_t("Real Length:")))
@@ -1318,9 +1610,10 @@ class PerspectiveMatcherPanel(QWidget):
         self.spin_target_len.setValue(5.0)
         self.spin_target_len.setSuffix(" m")
         target_row.addWidget(self.spin_target_len)
-        scale_lay.addLayout(target_row)
+        sec_scale.content_lay.addLayout(target_row)
 
         btn_scale_row = QHBoxLayout()
+        btn_scale_row.setSpacing(4)
         self.btn_measure_edge = QPushButton(_t("Read Edge"))
         self.btn_measure_edge.clicked.connect(self._on_read_selected_edge)
 
@@ -1330,118 +1623,13 @@ class PerspectiveMatcherPanel(QWidget):
 
         btn_scale_row.addWidget(self.btn_measure_edge)
         btn_scale_row.addWidget(self.btn_apply_scale)
-        scale_lay.addLayout(btn_scale_row)
+        sec_scale.content_lay.addLayout(btn_scale_row)
+        lay.addWidget(sec_scale)
 
-        lay.addWidget(scale_grp)
-
-        # --- Reference Photograph Section ---
-        photo_grp = QGroupBox(_t("Reference Photograph"))
-        photo_lay = QVBoxLayout(photo_grp)
-        photo_lay.setSpacing(6)
-
-        btn_row = QHBoxLayout()
-        self.btn_load = QPushButton(_t("Load Photograph…"))
-        self.btn_load.clicked.connect(self._on_load_photo)
-        self.btn_clear = QPushButton(_t("Clear Photo"))
-        self.btn_clear.clicked.connect(self._on_clear_photo)
-        btn_row.addWidget(self.btn_load)
-        btn_row.addWidget(self.btn_clear)
-        photo_lay.addLayout(btn_row)
-
-        self.lbl_path = QLabel("")
-        self.lbl_path.setStyleSheet("color: #888; font-size: 11px;")
-        self.lbl_path.setWordWrap(True)
-        photo_lay.addWidget(self.lbl_path)
-
-        opac_row = QHBoxLayout()
-        opac_row.addWidget(QLabel(_t("Opacity:")))
-        self.slider_opacity = QSlider(Qt.Horizontal)
-        self.slider_opacity.setRange(0, 100)
-        self.slider_opacity.setValue(int(self.plugin.data.image_opacity * 100))
-        self.slider_opacity.valueChanged.connect(self._on_opacity_changed)
-        self.lbl_opacity = QLabel(f"{int(self.plugin.data.image_opacity * 100)}%")
-        opac_row.addWidget(self.slider_opacity)
-        opac_row.addWidget(self.lbl_opacity)
-        photo_lay.addLayout(opac_row)
-
-        self.chk_show_photo = QCheckBox(_t("Show Background Photo"))
-        self.chk_show_photo.setChecked(self.plugin.data.show_image)
-        self.chk_show_photo.toggled.connect(self._on_toggle_show_photo)
-        photo_lay.addWidget(self.chk_show_photo)
-
-        lay.addWidget(photo_grp)
-
-        # --- Perspective Solver Section ---
-        solve_grp = QGroupBox(_t("Perspective & Guides"))
-        solve_lay = QVBoxLayout(solve_grp)
-        solve_lay.setSpacing(6)
-
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel(_t("Perspective Mode:")))
-        self.combo_mode = QComboBox()
-        self.combo_mode.addItem(_t("2-Point Perspective (SketchUp Style • Auto Z)"), "2point")
-        self.combo_mode.addItem(_t("3-Point Perspective (Manual Z1/Z2 Guides)"), "3point")
-        self.combo_mode.currentIndexChanged.connect(self._on_mode_changed)
-        mode_row.addWidget(self.combo_mode)
-        solve_lay.addLayout(mode_row)
-
-        self.chk_fix_verticals = QCheckBox(_t("Fix Vertical Lines (Level Horizon)"))
-        self.chk_fix_verticals.setChecked(getattr(self.plugin.data, "fix_verticals", True))
-        self.chk_fix_verticals.setStyleSheet("font-weight: bold; color: #FFA726;")
-        self.chk_fix_verticals.setToolTip(
-            _t("Keeps all vertical lines 100% vertical and displays the orange level horizon line (pitch = 0.0°)")
-        )
-        self.chk_fix_verticals.toggled.connect(self._on_toggle_fix_verticals)
-        solve_lay.addWidget(self.chk_fix_verticals)
-
-        inv_row1 = QHBoxLayout()
-        self.chk_inv_x = QCheckBox(_t("Invert X Axis"))
-        self.chk_inv_x.setChecked(self.plugin.data.invert_x)
-        self.chk_inv_x.toggled.connect(self._on_toggle_inv_x)
-        self.chk_inv_y = QCheckBox(_t("Invert Y Axis"))
-        self.chk_inv_y.setChecked(self.plugin.data.invert_y)
-        self.chk_inv_y.toggled.connect(self._on_toggle_inv_y)
-        inv_row1.addWidget(self.chk_inv_x)
-        inv_row1.addWidget(self.chk_inv_y)
-        solve_lay.addLayout(inv_row1)
-
-        inv_row2 = QHBoxLayout()
-        self.chk_inv_z = QCheckBox(_t("Invert Z Axis"))
-        self.chk_inv_z.setChecked(self.plugin.data.invert_z)
-        self.chk_inv_z.toggled.connect(self._on_toggle_inv_z)
-        self.chk_swap_xy = QCheckBox(_t("Swap X ⇄ Y"))
-        self.chk_swap_xy.setChecked(self.plugin.data.swap_xy)
-        self.chk_swap_xy.toggled.connect(self._on_toggle_swap_xy)
-        inv_row2.addWidget(self.chk_inv_z)
-        inv_row2.addWidget(self.chk_swap_xy)
-        solve_lay.addLayout(inv_row2)
-
-        self.chk_show_guides = QCheckBox(_t("Show Reference Guides"))
-        self.chk_show_guides.setChecked(self.plugin.data.show_guides)
-        self.chk_show_guides.toggled.connect(self._on_toggle_show_guides)
-        solve_lay.addWidget(self.chk_show_guides)
-
-        self.chk_lock_cam = QCheckBox(_t("Lock Viewport Camera"))
-        self.chk_lock_cam.setChecked(self.plugin.data.camera_locked)
-        self.chk_lock_cam.toggled.connect(self._on_toggle_lock_cam)
-        solve_lay.addWidget(self.chk_lock_cam)
-
-        btn_row2 = QHBoxLayout()
-        self.btn_align = QPushButton(_t("Align Camera Now"))
-        self.btn_align.setStyleSheet("background-color: #007ACC; color: white; font-weight: bold; padding: 5px;")
-        self.btn_align.clicked.connect(self.plugin.update_camera_from_guides)
-        self.btn_reset = QPushButton(_t("Reset Default Guides"))
-        self.btn_reset.clicked.connect(self._on_reset_guides)
-        btn_row2.addWidget(self.btn_align)
-        btn_row2.addWidget(self.btn_reset)
-        solve_lay.addLayout(btn_row2)
-
-        lay.addWidget(solve_grp)
-
-        # --- Readout & Calibration Info ---
-        info_grp = QGroupBox(_t("Camera Calibration"))
-        info_lay = QFormLayout(info_grp)
-        info_lay.setContentsMargins(8, 8, 8, 8)
+        # --- Section 5: Camera Calibration ---
+        sec_calib = CollapsibleSection(_t("Camera Calibration"), collapsed=False)
+        info_lay = QFormLayout()
+        info_lay.setContentsMargins(4, 4, 4, 4)
         info_lay.setSpacing(4)
 
         self.lbl_focal = QLabel("35.0 mm")
@@ -1455,8 +1643,12 @@ class PerspectiveMatcherPanel(QWidget):
         info_lay.addRow(_t("Camera Pitch / Yaw:"), self.lbl_orient)
         info_lay.addRow(_t("Status:"), self.lbl_status)
 
-        lay.addWidget(info_grp)
+        sec_calib.content_lay.addLayout(info_lay)
+        lay.addWidget(sec_calib)
+
         lay.addStretch(1)
+        self.scroll.setWidget(inner)
+        root_lay.addWidget(self.scroll, stretch=1)
 
         self.refresh_ui()
 
@@ -1510,6 +1702,9 @@ class PerspectiveMatcherPanel(QWidget):
             self.lbl_path.setStyleSheet("color: #888; font-size: 11px;")
 
         for w in (self.slider_opacity, self.chk_show_photo, self.chk_show_guides,
+                  self.chk_show_infinite_guides, self.chk_show_vertical_hairlines,
+                  self.spin_vertical_hairlines, self.chk_show_x_hairlines, self.spin_x_hairlines,
+                  self.chk_show_y_hairlines, self.spin_y_hairlines,
                   self.chk_lock_cam, self.spin_dist, self.slider_scale, self.chk_inv_x, self.chk_inv_y,
                   self.chk_inv_z, self.chk_swap_xy, self.combo_mode, self.chk_fix_verticals):
             w.blockSignals(True)
@@ -1518,6 +1713,16 @@ class PerspectiveMatcherPanel(QWidget):
         self.lbl_opacity.setText(f"{int(self.plugin.data.image_opacity * 100)}%")
         self.chk_show_photo.setChecked(self.plugin.data.show_image)
         self.chk_show_guides.setChecked(self.plugin.data.show_guides)
+        self.chk_show_infinite_guides.setChecked(getattr(self.plugin.data, "show_infinite_guides", True))
+        self.chk_show_vertical_hairlines.setChecked(getattr(self.plugin.data, "show_vertical_hairlines", True))
+        self.spin_vertical_hairlines.setValue(getattr(self.plugin.data, "vertical_hairlines_count", 9))
+        self.spin_vertical_hairlines.setEnabled(self.chk_show_vertical_hairlines.isChecked())
+        self.chk_show_x_hairlines.setChecked(getattr(self.plugin.data, "show_x_hairlines", False))
+        self.spin_x_hairlines.setValue(getattr(self.plugin.data, "x_hairlines_count", 7))
+        self.spin_x_hairlines.setEnabled(self.chk_show_x_hairlines.isChecked())
+        self.chk_show_y_hairlines.setChecked(getattr(self.plugin.data, "show_y_hairlines", False))
+        self.spin_y_hairlines.setValue(getattr(self.plugin.data, "y_hairlines_count", 7))
+        self.spin_y_hairlines.setEnabled(self.chk_show_y_hairlines.isChecked())
         self.chk_lock_cam.setChecked(self.plugin.data.camera_locked)
         self.spin_dist.setValue(self.plugin.data.distance)
         self.slider_scale.setValue(min(2000, max(10, int(self.plugin.data.distance * 10))))
@@ -1532,6 +1737,9 @@ class PerspectiveMatcherPanel(QWidget):
             self.combo_mode.setCurrentIndex(idx)
 
         for w in (self.slider_opacity, self.chk_show_photo, self.chk_show_guides,
+                  self.chk_show_infinite_guides, self.chk_show_vertical_hairlines,
+                  self.spin_vertical_hairlines, self.chk_show_x_hairlines, self.spin_x_hairlines,
+                  self.chk_show_y_hairlines, self.spin_y_hairlines,
                   self.chk_lock_cam, self.spin_dist, self.slider_scale, self.chk_inv_x, self.chk_inv_y,
                   self.chk_inv_z, self.chk_swap_xy, self.combo_mode, self.chk_fix_verticals):
             w.blockSignals(False)
@@ -1765,6 +1973,44 @@ class PerspectiveMatcherPanel(QWidget):
         self.plugin.update_camera_from_guides()
         self.plugin.save_state()
 
+    def _on_toggle_show_infinite_guides(self, checked: bool) -> None:
+        self.plugin.data.show_infinite_guides = checked
+        self.plugin.app.viewport.update()
+        self.plugin.save_state()
+
+    def _on_toggle_show_vertical_hairlines(self, checked: bool) -> None:
+        self.plugin.data.show_vertical_hairlines = checked
+        self.spin_vertical_hairlines.setEnabled(checked)
+        self.plugin.app.viewport.update()
+        self.plugin.save_state()
+
+    def _on_vertical_hairlines_count_changed(self, val: int) -> None:
+        self.plugin.data.vertical_hairlines_count = val
+        self.plugin.app.viewport.update()
+        self.plugin.save_state()
+
+    def _on_toggle_show_x_hairlines(self, checked: bool) -> None:
+        self.plugin.data.show_x_hairlines = checked
+        self.spin_x_hairlines.setEnabled(checked)
+        self.plugin.app.viewport.update()
+        self.plugin.save_state()
+
+    def _on_x_hairlines_count_changed(self, val: int) -> None:
+        self.plugin.data.x_hairlines_count = val
+        self.plugin.app.viewport.update()
+        self.plugin.save_state()
+
+    def _on_toggle_show_y_hairlines(self, checked: bool) -> None:
+        self.plugin.data.show_y_hairlines = checked
+        self.spin_y_hairlines.setEnabled(checked)
+        self.plugin.app.viewport.update()
+        self.plugin.save_state()
+
+    def _on_y_hairlines_count_changed(self, val: int) -> None:
+        self.plugin.data.y_hairlines_count = val
+        self.plugin.app.viewport.update()
+        self.plugin.save_state()
+
     def _on_reset_guides(self) -> None:
         d = PerspectiveMatchData()
         d.image_path = self.plugin.data.image_path
@@ -1775,6 +2021,13 @@ class PerspectiveMatcherPanel(QWidget):
         d.active_view_index = self.plugin.data.active_view_index
         d.enabled = self.plugin.data.enabled
         d.fix_verticals = self.plugin.data.fix_verticals
+        d.show_infinite_guides = self.plugin.data.show_infinite_guides
+        d.show_vertical_hairlines = self.plugin.data.show_vertical_hairlines
+        d.vertical_hairlines_count = self.plugin.data.vertical_hairlines_count
+        d.show_x_hairlines = self.plugin.data.show_x_hairlines
+        d.x_hairlines_count = self.plugin.data.x_hairlines_count
+        d.show_y_hairlines = self.plugin.data.show_y_hairlines
+        d.y_hairlines_count = self.plugin.data.y_hairlines_count
         self.plugin.data = d
         self.refresh_ui()
         self.plugin.update_camera_from_guides()
@@ -2731,6 +2984,19 @@ class PerspectiveMatcherPlugin:
         COLOR_ORIGIN = QColor(255, 149, 0)
         COLOR_HORIZON = QColor(255, 214, 10, 180)
 
+        def draw_infinite_guide(pt_a: QPointF, pt_b: QPointF, color: QColor) -> None:
+            gdx = pt_b.x() - pt_a.x()
+            gdy = pt_b.y() - pt_a.y()
+            if abs(gdx) < 1e-6 and abs(gdy) < 1e-6:
+                return
+            res = clip_line_to_rect(pt_a.x(), pt_a.y(), gdx, gdy, 0.0, 0.0, float(w), float(h))
+            if res is not None:
+                (x1, y1), (x2, y2) = res
+                thin_col = QColor(color.red(), color.green(), color.blue(), 160)
+                pen_inf = QPen(thin_col, 1.0, Qt.SolidLine)
+                painter.setPen(pen_inf)
+                painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
         def draw_line_pair(
             p1_a: QPointF, p1_b: QPointF,
             p2_a: QPointF, p2_b: QPointF,
@@ -2739,6 +3005,10 @@ class PerspectiveMatcherPlugin:
             handle_a1: str, handle_b1: str,
             handle_a2: str, handle_b2: str
         ) -> None:
+            if getattr(self.data, "show_infinite_guides", True):
+                draw_infinite_guide(p1_a, p1_b, color)
+                draw_infinite_guide(p2_a, p2_b, color)
+
             pen = QPen(color, 2.0, Qt.SolidLine)
             painter.setPen(pen)
             painter.drawLine(p1_a, p1_b)
@@ -2822,6 +3092,108 @@ class PerspectiveMatcherPlugin:
                     painter.setPen(QPen(active_horizon_color))
                     y_lbl = max(14.0, min(float(h) - 20.0, y_at_0 - 16.0))
                     painter.drawText(QPointF(15.0, y_lbl), h_label)
+
+        # 4b. Draw Vertical Reference Hairlines (Z-Axis Alignment Grid) across the photograph
+        if getattr(self.data, "show_vertical_hairlines", True):
+            hair_z_col = QColor(0, 102, 255, 235)  # Rich electric royal blue (matching Z-axis)
+            pen_z_hair = QPen(hair_z_col, 1.0, Qt.SolidLine)
+            painter.setPen(pen_z_hair)
+
+            img_top = img_rect.top()
+            img_bottom = img_rect.bottom()
+            img_mid_y = img_rect.top() + img_rect.height() * 0.5
+
+            count_z = max(2, min(50, getattr(self.data, "vertical_hairlines_count", 9)))
+            use_vp_z = (not getattr(self.data, "fix_verticals", True) or self.data.mode == "3point") and (self.solved.vp_z is not None)
+
+            for k in range(1, count_z + 1):
+                frac = k / (count_z + 1.0)
+                anchor_x = img_rect.left() + frac * img_rect.width()
+
+                dir_x = self.solved.screen_z_dir[0]
+                dir_y = self.solved.screen_z_dir[1]
+                # When vertical lines are not fixed to 90° (camera has pitch/tilt or 3-point mode),
+                # vertical lines follow true 3D perspective convergence towards the 3rd vanishing point (Vz).
+                if use_vp_z:
+                    vdx = self.solved.vp_z[0] - anchor_x
+                    vdy = self.solved.vp_z[1] - img_mid_y
+                    vlen = math.hypot(vdx, vdy)
+                    if vlen > 1e-4:
+                        dir_x = vdx / vlen
+                        dir_y = vdy / vlen
+
+                if abs(dir_y) > 1e-5:
+                    t_top = (img_top - img_mid_y) / dir_y
+                    x_top = anchor_x + t_top * dir_x
+
+                    t_bottom = (img_bottom - img_mid_y) / dir_y
+                    x_bottom = anchor_x + t_bottom * dir_x
+
+                    painter.drawLine(QPointF(x_top, img_top), QPointF(x_bottom, img_bottom))
+
+        # 4c. Draw Red Dotted Hairlines (X-Axis Alignment Grid converging to Vx) across the photograph
+        if getattr(self.data, "show_x_hairlines", False):
+            hair_x_col = QColor(245, 65, 75, 210)  # Red matching X-axis
+            pen_x_hair = QPen(hair_x_col, 1.0, Qt.CustomDashLine)
+            pen_x_hair.setDashPattern([4.0, 4.0])
+            painter.setPen(pen_x_hair)
+
+            count_x = max(2, min(50, getattr(self.data, "x_hairlines_count", 7)))
+            img_mid_x = img_rect.left() + img_rect.width() * 0.5
+
+            for k in range(1, count_x + 1):
+                frac = k / (count_x + 1.0)
+                anchor_y = img_rect.top() + frac * img_rect.height()
+
+                dir_x = self.solved.screen_x_dir[0]
+                dir_y = self.solved.screen_x_dir[1]
+                if self.solved.vp_x is not None:
+                    vdx = img_mid_x - self.solved.vp_x[0]
+                    vdy = anchor_y - self.solved.vp_x[1]
+                    vlen = math.hypot(vdx, vdy)
+                    if vlen > 1e-4:
+                        dir_x = vdx / vlen
+                        dir_y = vdy / vlen
+
+                res_clip = clip_line_to_rect(
+                    img_mid_x, anchor_y, dir_x, dir_y,
+                    img_rect.left(), img_rect.top(), img_rect.right(), img_rect.bottom()
+                )
+                if res_clip is not None:
+                    (c1_x, c1_y), (c2_x, c2_y) = res_clip
+                    painter.drawLine(QPointF(c1_x, c1_y), QPointF(c2_x, c2_y))
+
+        # 4d. Draw Green Dotted Hairlines (Y-Axis Alignment Grid converging to Vy) across the photograph
+        if getattr(self.data, "show_y_hairlines", False):
+            hair_y_col = QColor(45, 200, 105, 210)  # Green matching Y-axis
+            pen_y_hair = QPen(hair_y_col, 1.0, Qt.CustomDashLine)
+            pen_y_hair.setDashPattern([4.0, 4.0])
+            painter.setPen(pen_y_hair)
+
+            count_y = max(2, min(50, getattr(self.data, "y_hairlines_count", 7)))
+            img_mid_x = img_rect.left() + img_rect.width() * 0.5
+
+            for k in range(1, count_y + 1):
+                frac = k / (count_y + 1.0)
+                anchor_y = img_rect.top() + frac * img_rect.height()
+
+                dir_x = self.solved.screen_y_dir[0]
+                dir_y = self.solved.screen_y_dir[1]
+                if self.solved.vp_y is not None:
+                    vdx = img_mid_x - self.solved.vp_y[0]
+                    vdy = anchor_y - self.solved.vp_y[1]
+                    vlen = math.hypot(vdx, vdy)
+                    if vlen > 1e-4:
+                        dir_x = vdx / vlen
+                        dir_y = vdy / vlen
+
+                res_clip = clip_line_to_rect(
+                    img_mid_x, anchor_y, dir_x, dir_y,
+                    img_rect.left(), img_rect.top(), img_rect.right(), img_rect.bottom()
+                )
+                if res_clip is not None:
+                    (c1_x, c1_y), (c2_x, c2_y) = res_clip
+                    painter.drawLine(QPointF(c1_x, c1_y), QPointF(c2_x, c2_y))
 
         # Draw Origin Handle
         p_orig = to_px(self.data.origin)
