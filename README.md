@@ -24,6 +24,15 @@
   * Adjusting the scale slider freely changes camera distance without altering model measurements.
   * When explicitly enabled, uniform scaling executes safely through IngeTrazo's transactional command history (`viewport.history.execute`) with automatic rollback protection.
   * **Remembers Original Scale**: Tracks baseline scale across sessions (saved directly into `.igz`), allowing you to restore the model at any time with the **"🔄 Reset to Original"** button.
+* **🎨 Project Textures to Faces (SketchUp-style)**:
+  * Rectifies and projects the matched photograph onto selected 3D mesh faces.
+  * Corrects perspective distortion and creates planar-rectified textures mapped onto face UV coordinates.
+  * Switches viewport display style automatically to texture mode for instant visual feedback.
+* **✨ Infinite Vanishing Rays & Precision Dotted Guides**:
+  * Toggle infinite vanishing lines extending to the horizon.
+  * Toggle thin dotted guide lines to align geometry with sub-pixel precision.
+  * Perspective-accurate vertical guidelines when 3-point perspective is active.
+* **📜 Ergonomic Scrollable Panel**: Smooth vertical scrolling ensuring all controls, buttons, and sliders are fully accessible on smaller displays.
 * **💾 Document Integration**: Calibration, photo path, cumulative scale, and guide handles are saved directly inside your IngeTrazo document (`.igz`).
 
 ---

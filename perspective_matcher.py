@@ -17,7 +17,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QByteArray, QBuffer, QEvent, QIODevice, QObject, QPointF, QRectF, Qt
 from PySide6.QtGui import (
-    QBrush, QColor, QFont, QMatrix4x4, QPainter, QPainterPath, QPen, QPixmap, QVector3D
+    QBrush, QColor, QFont, QImage, QMatrix4x4, QPainter, QPainterPath, QPen, QPixmap,
+    QPolygonF, QTransform, QVector3D, QVector4D
 )
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
@@ -957,6 +958,7 @@ class PerspectiveEventFilter(QObject):
         self.hovered_tab_index: Optional[int] = None
         self.hovered_add_btn: bool = False
         self.hovered_scale_btn: bool = False
+        self.hovered_project_btn: bool = False
         self.is_shift_held: bool = False
         self.last_mouse_pos: Optional[QPointF] = None
 
@@ -992,6 +994,7 @@ class PerspectiveEventFilter(QObject):
             hit_tab = self._hit_test_tabs(pos.x(), pos.y())
             hit_add = (self.plugin.add_view_rect is not None and self.plugin.add_view_rect.contains(pos))
             hit_scale = (self.plugin.scale_tool_rect is not None and self.plugin.scale_tool_rect.contains(pos))
+            hit_project = (self.plugin.project_tool_rect is not None and self.plugin.project_tool_rect.contains(pos))
 
             changed = False
             if hit_tab != self.hovered_tab_index:
@@ -1003,15 +1006,18 @@ class PerspectiveEventFilter(QObject):
             if hit_scale != self.hovered_scale_btn:
                 self.hovered_scale_btn = hit_scale
                 changed = True
+            if hit_project != self.hovered_project_btn:
+                self.hovered_project_btn = hit_project
+                changed = True
 
-            if hit_tab is not None or hit_add or hit_scale:
+            if hit_tab is not None or hit_add or hit_scale or hit_project:
                 vp.setCursor(Qt.PointingHandCursor)
                 if changed:
                     vp.update()
                 return False
             else:
                 if self.hovered_handle is None and (
-                    self.hovered_tab_index is not None or self.hovered_add_btn or self.hovered_scale_btn
+                    self.hovered_tab_index is not None or self.hovered_add_btn or self.hovered_scale_btn or self.hovered_project_btn
                 ):
                     vp.unsetCursor()
                 if changed:
@@ -1036,6 +1042,17 @@ class PerspectiveEventFilter(QObject):
             # Calibrate scale button click [📏]
             if self.plugin.scale_tool_rect is not None and self.plugin.scale_tool_rect.contains(pos):
                 self.plugin.open_scale_dialog()
+                vp.update()
+                return True
+
+            # Project textures button click [📷]
+            if self.plugin.project_tool_rect is not None and self.plugin.project_tool_rect.contains(pos):
+                try:
+                    self.plugin.project_textures_from_photo()
+                except Exception as exc:
+                    import traceback
+                    tb = traceback.format_exc()
+                    QMessageBox.critical(None, _t("Texture Projection Error"), f"{type(exc).__name__}: {exc}\n\n{tb}")
                 vp.update()
                 return True
 
@@ -1409,6 +1426,17 @@ class PerspectiveMatcherPanel(QWidget):
         photo_ctrl_row.addWidget(self.slider_opacity, stretch=1)
         photo_ctrl_row.addWidget(self.lbl_opacity)
         sec_photo.content_lay.addLayout(photo_ctrl_row)
+
+        self.btn_project_textures = QPushButton(_t("📷 Project Textures from Photo"))
+        self.btn_project_textures.setToolTip(_t("Project the background photo as texture onto visible front-facing surfaces of selected geometry (or all geometry if none selected)."))
+        self.btn_project_textures.setStyleSheet(
+            "QPushButton { font-weight: bold; background-color: #2b5b84; color: white; padding: 5px 8px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #3572a5; }"
+            "QPushButton:disabled { background-color: #3a4048; color: #777; }"
+        )
+        self.btn_project_textures.clicked.connect(self._on_project_textures)
+        sec_photo.content_lay.addWidget(self.btn_project_textures)
+
         lay.addWidget(sec_photo)
 
         # --- Section 3: Perspective Guides ---
@@ -1757,6 +1785,10 @@ class PerspectiveMatcherPanel(QWidget):
                 self.btn_lock_cam.setToolTip(_t("Lock camera so it cannot move, rotate, or zoom."))
                 self.btn_lock_cam.setStyleSheet("")
 
+        if hasattr(self, "btn_project_textures"):
+            has_photo = self.plugin.pixmap is not None and not self.plugin.pixmap.isNull()
+            self.btn_project_textures.setEnabled(has_photo)
+
         self.refresh_scale_ui()
 
     def refresh_scale_ui(self) -> None:
@@ -1867,6 +1899,14 @@ class PerspectiveMatcherPanel(QWidget):
     def _on_clear_photo(self) -> None:
         self.plugin.clear_image()
         self.refresh_ui()
+
+    def _on_project_textures(self) -> None:
+        try:
+            self.plugin.project_textures_from_photo()
+        except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            QMessageBox.critical(self, _t("Texture Projection Error"), f"{type(exc).__name__}: {exc}\n\n{tb}")
 
     def _on_opacity_changed(self, val: int) -> None:
         self.plugin.data.image_opacity = val / 100.0
@@ -2049,6 +2089,7 @@ class PerspectiveMatcherPlugin:
         self.scene_tab_rects: List[Tuple[QRectF, int]] = []
         self.add_view_rect: Optional[QRectF] = None
         self.scale_tool_rect: Optional[QRectF] = None
+        self.project_tool_rect: Optional[QRectF] = None
 
         # Load persisted document data
         self.load_state_from_document()
@@ -2664,6 +2705,367 @@ class PerspectiveMatcherPlugin:
         cancel_btn.clicked.connect(dlg.reject)
         dlg.exec()
 
+    def _fit_face_uvw(self, points, uvs) -> Optional[List[float]]:
+        """Fits an 8-float affine UV map [gu.x, gu.y, gu.z, cu, gv.x, gv.y, gv.z, cv]
+        for face vertices and their projected photo UVs.
+        Uses least-squares regression when >= 3 points are available.
+        """
+        n = len(points)
+        if n < 3 or len(uvs) < n:
+            return None
+        try:
+            import numpy as np
+            coords = []
+            for p in points:
+                if hasattr(p, "x"):
+                    coords.append([p.x(), p.y(), p.z(), 1.0])
+                else:
+                    coords.append([p[0], p[1], p[2], 1.0])
+            A = np.asarray(coords, dtype=np.float64)
+            bu = np.asarray([uv[0] for uv in uvs], dtype=np.float64)
+            bv = np.asarray([uv[1] for uv in uvs], dtype=np.float64)
+            sol_u, _, rank_u, _ = np.linalg.lstsq(A, bu, rcond=None)
+            sol_v, _, rank_v, _ = np.linalg.lstsq(A, bv, rcond=None)
+            if rank_u < 3 or rank_v < 3:
+                from core.texture import fit_uv_affine
+                return fit_uv_affine(points, uvs)
+            return [
+                float(sol_u[0]), float(sol_u[1]), float(sol_u[2]), float(sol_u[3]),
+                float(sol_v[0]), float(sol_v[1]), float(sol_v[2]), float(sol_v[3]),
+            ]
+        except Exception:
+            try:
+                from core.texture import fit_uv_affine
+                return fit_uv_affine(points, uvs)
+            except Exception:
+                return None
+
+    def _get_or_save_projected_image_path(self) -> str:
+        """Returns a valid file path on disk for the current reference photograph."""
+        path = self.data.image_path
+        if path and os.path.exists(path):
+            return path
+        try:
+            from core.texture import texture_cache_root
+            cache_dir = texture_cache_root() / "projected_photos"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            active_idx = getattr(self.data, "active_view_index", 0)
+            img_name = f"projected_photo_view_{active_idx}.png"
+            save_path = str(cache_dir / img_name)
+            if self.pixmap and not self.pixmap.isNull():
+                self.pixmap.save(save_path, "PNG")
+                self.data.image_path = save_path
+                return save_path
+        except Exception:
+            pass
+        return path or ""
+
+    def project_textures_from_photo(self) -> Tuple[bool, str]:
+        """Projects the background reference photograph onto visible front-facing
+        surfaces of selected 3D geometry (or all geometry if none selected).
+        Fully integrated with IngeTrazo's undo/redo history.
+        """
+        if self.pixmap is None or self.pixmap.isNull():
+            msg = _t("No photograph loaded. Please load a photograph first.")
+            QMessageBox.warning(None, _t("Project Textures"), msg)
+            return False, msg
+
+        # If not currently in match view, switch to match view
+        curr_view = self.data.saved_views[self.data.active_view_index] if 0 <= self.data.active_view_index < len(self.data.saved_views) else None
+        if not self.data.enabled or (curr_view and curr_view.get("type") != "match"):
+            match_idx = next((i for i, v in enumerate(self.data.saved_views) if v.get("type") == "match"), None)
+            if match_idx is not None and match_idx != self.data.active_view_index:
+                self.switch_to_view(match_idx)
+
+        vp = getattr(self.app, "viewport", None)
+        if vp is None or not hasattr(vp, "camera"):
+            return False, _t("Viewport not available.")
+
+        photo_path = self._get_or_save_projected_image_path()
+        if not photo_path or not os.path.exists(photo_path):
+            msg = _t("Could not locate or save photograph file to disk.")
+            QMessageBox.warning(None, _t("Project Textures"), msg)
+            return False, msg
+
+        w, h = vp.width(), vp.height()
+        img_rect = self.get_image_rect(w, h)
+        img_l = img_rect.left()
+        img_t = img_rect.top()
+        img_w = max(img_rect.width(), 1.0)
+        img_h = max(img_rect.height(), 1.0)
+
+        # Collect target faces: selection if available, otherwise entire scene
+        from core.mesh import Face
+        from core.materials import Material
+        from core.history import CompoundCommand, SetFaceTextureCommand, SetFaceMaterialTagCommand
+
+        target_faces: List[Tuple[Any, Optional[QMatrix4x4]]] = []
+        sel = getattr(self.app.scene, "selection", set())
+        if sel:
+            for ent in sel:
+                if isinstance(ent, Face):
+                    target_faces.append((ent, None))
+                elif hasattr(ent, "mesh") and getattr(ent.mesh, "faces", None):
+                    from core.group import iter_placements
+                    for g, m in iter_placements(ent):
+                        for f in g.mesh.faces:
+                            target_faces.append((f, m))
+
+        if not target_faces:
+            for f, m in self.app.scene.iter_world_faces():
+                if getattr(f, "attrs", {}).get("faceme"):
+                    continue
+                target_faces.append((f, m))
+
+        if not target_faces:
+            msg = _t("No 3D geometry found in the scene to project textures onto.")
+            QMessageBox.information(None, _t("Project Textures"), msg)
+            return False, msg
+
+        # Open source photograph with QImage (zero external dependencies, pure Qt)
+        src_photo = QImage(photo_path)
+        if src_photo.isNull():
+            if self.pixmap and not self.pixmap.isNull():
+                src_photo = self.pixmap.toImage()
+        if src_photo.isNull():
+            msg = _t("Could not load reference photograph image.")
+            QMessageBox.warning(None, _t("Project Textures"), msg)
+            return False, msg
+
+        pw, ph = float(src_photo.width()), float(src_photo.height())
+
+        from core.texture import cache_image
+        from PySide6.QtGui import QTransform, QPolygonF, QPainter
+        from PySide6.QtCore import QPointF, QBuffer, QIODevice, Qt
+
+        cam = vp.camera
+        eye = cam.eye()
+        commands: List[Any] = []
+        projected_count = 0
+
+        # View directions
+        if getattr(self.data, "fix_verticals", True) and self.data.mode != "3point":
+            cam_up_w = QVector3D(0.0, 0.0, 1.0)
+            level_w = QVector3D(self.solved.forward.x(), self.solved.forward.y(), 0.0)
+            if level_w.length() < 1e-4:
+                level_w = QVector3D(0.0, 1.0, 0.0)
+            level_w.normalize()
+            cam_right_w = QVector3D.crossProduct(level_w, cam_up_w).normalized()
+        else:
+            cam_up_w = self.solved.up_w.normalized() if self.solved.up_w.length() > 1e-4 else QVector3D(0.0, 0.0, 1.0)
+            fwd_w = self.solved.forward.normalized()
+            cam_right_w = QVector3D.crossProduct(fwd_w, cam_up_w).normalized()
+            cam_up_w = QVector3D.crossProduct(cam_right_w, fwd_w).normalized()
+
+        def world_to_photo(pt: QVector3D) -> Optional[Tuple[float, float]]:
+            pix = vp.world_to_pixel(pt)
+            if pix is None:
+                return None
+            px, py = pix
+            u_px = (px - img_l) / img_w * pw
+            v_px = (py - img_t) / img_h * ph
+            return (u_px, v_px)
+
+        for face, m in target_faces:
+            local_verts = list(face.vertices)
+            if len(local_verts) < 3:
+                continue
+
+            if m is not None:
+                world_verts = [m.map(p) for p in local_verts]
+            else:
+                world_verts = local_verts
+
+            cx = sum(p.x() for p in world_verts) / len(world_verts)
+            cy = sum(p.y() for p in world_verts) / len(world_verts)
+            cz = sum(p.z() for p in world_verts) / len(world_verts)
+            center = QVector3D(cx, cy, cz)
+
+            n_local = face.normal()
+            if m is not None:
+                p0 = local_verts[0]
+                nw = (m.map(p0 + n_local) - m.map(p0)).normalized()
+            else:
+                nw = n_local.normalized()
+
+            view_dir = (eye - center).normalized()
+            dot = QVector3D.dotProduct(nw, view_dir)
+            if dot <= 0.02:
+                # Facing away or glancing angle
+                continue
+
+            # Check if any vertex of the face projects in or near the photograph
+            in_view = False
+            for pw_vert in world_verts:
+                px_coord = vp.world_to_pixel(pw_vert)
+                if px_coord is not None:
+                    px, py = px_coord
+                    if (img_l - 0.15 * img_w <= px <= img_l + 1.15 * img_w and
+                        img_t - 0.15 * img_h <= py <= img_t + 1.15 * img_h):
+                        in_view = True
+                        break
+            if not in_view:
+                continue
+
+            # Establish orthonormal in-plane basis (u_axis, v_axis) aligned with camera view
+            nz = abs(nw.z())
+            if nz < 0.9:
+                u_axis = QVector3D.crossProduct(nw, QVector3D(0.0, 0.0, 1.0)).normalized()
+                v_axis = QVector3D.crossProduct(u_axis, nw).normalized()
+            else:
+                u_axis = cam_right_w
+                v_axis = QVector3D.crossProduct(nw, u_axis).normalized()
+
+            if QVector3D.dotProduct(u_axis, cam_right_w) < 0:
+                u_axis = -u_axis
+            if QVector3D.dotProduct(v_axis, cam_up_w) < 0:
+                v_axis = -v_axis
+
+            u_vals = [QVector3D.dotProduct(p, u_axis) for p in world_verts]
+            v_vals = [QVector3D.dotProduct(p, v_axis) for p in world_verts]
+            u_min, u_max = min(u_vals), max(u_vals)
+            v_min, v_max = min(v_vals), max(v_vals)
+            span_u = max(1e-4, u_max - u_min)
+            span_v = max(1e-4, v_max - v_min)
+
+            # 4 3D corners of the bounding rectangle on the face's plane
+            u_c = QVector3D.dotProduct(center, u_axis)
+            v_c = QVector3D.dotProduct(center, v_axis)
+            p_tl = center + u_axis * (u_min - u_c) + v_axis * (v_max - v_c)
+            p_bl = center + u_axis * (u_min - u_c) + v_axis * (v_min - v_c)
+            p_br = center + u_axis * (u_max - u_c) + v_axis * (v_min - v_c)
+            p_tr = center + u_axis * (u_max - u_c) + v_axis * (v_max - v_c)
+
+            q_tl = world_to_photo(p_tl)
+            q_bl = world_to_photo(p_bl)
+            q_br = world_to_photo(p_br)
+            q_tr = world_to_photo(p_tr)
+
+            if not (q_tl and q_bl and q_br and q_tr):
+                # If bounding corners project behind camera, skip or clamp
+                continue
+
+            aspect = span_u / span_v
+            diag_px = math.hypot(q_br[0] - q_tl[0], q_br[1] - q_tl[1])
+            max_dim = min(2048, max(256, int(round(diag_px * 1.2))))
+            if aspect >= 1.0:
+                tw = max_dim
+                th = max(64, int(round(max_dim / aspect)))
+            else:
+                th = max_dim
+                tw = max(64, int(round(max_dim * aspect)))
+
+            poly_src = QPolygonF([
+                QPointF(q_tl[0], q_tl[1]),
+                QPointF(q_tr[0], q_tr[1]),
+                QPointF(q_br[0], q_br[1]),
+                QPointF(q_bl[0], q_bl[1]),
+            ])
+            poly_dst = QPolygonF([
+                QPointF(0.0, 0.0),
+                QPointF(float(tw), 0.0),
+                QPointF(float(tw), float(th)),
+                QPointF(0.0, float(th)),
+            ])
+            xf = QTransform()
+            ok = QTransform.quadToQuad(poly_src, poly_dst, xf)
+            if not ok:
+                continue
+
+            face_img = QImage(tw, th, QImage.Format_RGB32)
+            face_img.fill(Qt.black)
+            p = QPainter(face_img)
+            p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            p.setTransform(xf)
+            p.drawImage(0, 0, src_photo)
+            p.end()
+
+            # Save rectified texture to content-addressed cache
+            qbuf = QBuffer()
+            qbuf.open(QIODevice.WriteOnly)
+            face_img.save(qbuf, "PNG")
+            face_tex_path = cache_image(bytes(qbuf.data()), f"proj_photo_f{id(face)}.png", "projected")
+
+            # In-plane affine UV map (world space)
+            gu_w = u_axis / span_u
+            gv_w = v_axis / span_v
+            cu_w = -u_min / span_u
+            cv_w = -v_min / span_v
+
+            # Remap uvw if face is inside a transformed group
+            if m is not None:
+                T = QVector3D(m(0, 3), m(1, 3), m(2, 3))
+                gu = QVector3D(
+                    m(0, 0) * gu_w.x() + m(1, 0) * gu_w.y() + m(2, 0) * gu_w.z(),
+                    m(0, 1) * gu_w.x() + m(1, 1) * gu_w.y() + m(2, 1) * gu_w.z(),
+                    m(0, 2) * gu_w.x() + m(1, 2) * gu_w.y() + m(2, 2) * gu_w.z(),
+                )
+                gv = QVector3D(
+                    m(0, 0) * gv_w.x() + m(1, 0) * gv_w.y() + m(2, 0) * gv_w.z(),
+                    m(0, 1) * gv_w.x() + m(1, 1) * gv_w.y() + m(2, 1) * gv_w.z(),
+                    m(0, 2) * gv_w.x() + m(1, 2) * gv_w.y() + m(2, 2) * gv_w.z(),
+                )
+                cu = cu_w + QVector3D.dotProduct(gu_w, T)
+                cv = cv_w + QVector3D.dotProduct(gv_w, T)
+            else:
+                gu, gv = gu_w, gv_w
+                cu, cv = cu_w, cv_w
+
+            uvw = [
+                float(gu.x()), float(gu.y()), float(gu.z()), float(cu),
+                float(gv.x()), float(gv.y()), float(gv.z()), float(cv),
+            ]
+
+            mat_name = f"Photo_Face_{projected_count + 1}"
+            mat = Material(name=mat_name, texture={"path": str(face_tex_path), "sw": 1.0, "sh": 1.0})
+            tex_dict = {
+                "path": str(face_tex_path),
+                "uvw": uvw,
+                "sw": 1.0,
+                "sh": 1.0,
+            }
+            commands.append(SetFaceTextureCommand([face], tex_dict))
+            commands.append(SetFaceMaterialTagCommand([face], mat_name, mat))
+            projected_count += 1
+
+        if not commands:
+            msg = _t("No front-facing visible surfaces found in the current camera view.")
+            QMessageBox.information(None, _t("Project Textures"), msg)
+            return False, msg
+
+        cmd = CompoundCommand(commands)
+        vp.history.execute(cmd)
+
+        # 1. Switch display style face_mode to 'textures' if in monochrome/shaded/hidden_line
+        if hasattr(self.app.scene, "display_style"):
+            ds = getattr(self.app.scene, "display_style", None)
+            if ds is not None and getattr(ds, "face_mode", None) not in ("textures", "xray"):
+                ds.face_mode = "textures"
+
+        # 2. Invalidate viewport caches so OpenGL textures upload immediately
+        if hasattr(vp, "invalidate_caches"):
+            try:
+                vp.invalidate_caches()
+            except Exception:
+                pass
+        if hasattr(vp, "_tex_cache") and isinstance(vp._tex_cache, dict):
+            vp._tex_cache.clear()
+
+        notify = getattr(vp, "notify_scene_changed", None)
+        if callable(notify):
+            notify()
+        if hasattr(self.app.scene, "bump_view"):
+            try:
+                self.app.scene.bump_view()
+            except Exception:
+                pass
+        vp.update()
+
+        succ_msg = _t(f"Successfully projected photo texture onto {projected_count} surface(s).")
+        self._show_status_message(succ_msg, 4000)
+        QMessageBox.information(None, _t("Textures Projected"), succ_msg)
+        return True, succ_msg
+
     def update_camera_from_guides(self) -> None:
         """Solves perspective from current guides and sets IngeTrazo's OrbitCamera."""
         vp = self.app.viewport
@@ -2714,6 +3116,7 @@ class PerspectiveMatcherPlugin:
         self.scene_tab_rects = []
         self.add_view_rect = None
         self.scale_tool_rect = None
+        self.project_tool_rect = None
 
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -2797,6 +3200,25 @@ class PerspectiveMatcherPlugin:
 
         painter.setPen(QPen(Qt.white))
         painter.drawText(scale_rect, Qt.AlignCenter, scale_label)
+
+        x += scale_btn_w + 6.0
+
+        # Project Textures Button [📷 Project]
+        project_label = f"📷 {_t('Project')}"
+        project_btn_w = fm.horizontalAdvance(project_label) + 18.0
+        project_rect = QRectF(x, y, project_btn_w, tab_h)
+        self.project_tool_rect = project_rect
+
+        is_project_hover = getattr(self.filter, "hovered_project_btn", False)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(0, 122, 204, 210) if is_project_hover else QColor(30, 34, 44, 190)))
+        painter.drawRoundedRect(project_rect, 4.0, 4.0)
+        painter.setPen(QPen(QColor(255, 255, 255, 60), 1.0))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(project_rect, 4.0, 4.0)
+
+        painter.setPen(QPen(Qt.white))
+        painter.drawText(project_rect, Qt.AlignCenter, project_label)
 
         painter.restore()
 
@@ -3353,3 +3775,21 @@ def setup(app) -> None:
     )
 
     app.on_document_changed(lambda: plugin.on_document_changed())
+
+    def _on_context_menu(menu, selection):
+        if plugin.pixmap is not None and not plugin.pixmap.isNull():
+            action = menu.addAction(_t("📷 Project Textures from Photo"))
+            action.setStatusTip(_t("Project reference photo as texture onto visible surfaces."))
+            def _do_context_proj():
+                try:
+                    plugin.project_textures_from_photo()
+                except Exception as exc:
+                    import traceback
+                    tb = traceback.format_exc()
+                    QMessageBox.critical(None, _t("Texture Projection Error"), f"{type(exc).__name__}: {exc}\n\n{tb}")
+            action.triggered.connect(_do_context_proj)
+
+    try:
+        app.add_context_menu(_on_context_menu)
+    except Exception:
+        pass
